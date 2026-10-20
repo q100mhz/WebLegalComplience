@@ -1,0 +1,84 @@
+# WeLegal Compliance
+
+Онлайн-сервис автоматической проверки сайтов на соответствие законодательству РФ.
+Прод: https://welegalcomplience.itb2bhost.ru
+
+Пользователь вводит адрес сайта → воркер обходит до 30 страниц настоящим браузером (Playwright/Chromium) →
+движок правил формирует заключение: нарушения, риски, статьи закона, ориентировочные штрафы.
+
+## Что проверяется
+
+| Проверка | Основание |
+|---|---|
+| Политика обработки ПДн: наличие, доступность, обязательные разделы | 152-ФЗ, ст. 18.1 |
+| Согласие в формах, предустановленные галочки, отдельный документ согласия | 152-ФЗ, ст. 9 (ред. 156-ФЗ) |
+| Cookies и метрики до согласия, cookie-баннер | 152-ФЗ |
+| Иностранные сервисы (GA, reCAPTCHA, Google Fonts, пиксели) | 152-ФЗ, ст. 12, 18 |
+| Страна сервера | 152-ФЗ, ч. 5 ст. 18 |
+| Авторизация через Google/Apple/Facebook | 149-ФЗ, ст. 10 (ред. 406-ФЗ) |
+| Ссылки на Instagram/Facebook без пометки | 114-ФЗ |
+| Маркировка рекламы (erid) | 38-ФЗ, ст. 18.1 |
+| Сведения о владельце сайта | 149-ФЗ, ст. 10 |
+| Интернет-торговля: оферта, доставка, оплата, возврат | ЗоЗПП, ПП № 2463 |
+| Возрастная маркировка | 436-ФЗ |
+| Русский язык | 53-ФЗ |
+| HTTPS, HSTS | 152-ФЗ, ст. 19 |
+
+## Архитектура
+
+```
+nginx (хост) ─┬─ /api → 127.0.0.1:8100  api      FastAPI
+              └─ /    → 127.0.0.1:3100  frontend Next.js
+                                         worker   arq + Playwright (сканирование)
+                                         postgres результаты проверок
+                                         redis    очередь задач, rate limit
+```
+
+- `backend/app/scanner/crawler.py` — обход сайта, сбор форм, cookies, сетевых запросов
+- `backend/app/scanner/checks/` — правила проверок (добавить проверку = функция + строка в `checks/__init__.py`)
+- `backend/app/scanner/services_db.py` — справочник иностранных/российских сервисов и трекеров
+- `frontend/app/scan/[id]/page.tsx` — страница прогресса и отчёта
+
+## Локальная разработка
+
+```bash
+cd backend && python3 -m venv .venv && .venv/bin/pip install -r requirements-dev.txt
+.venv/bin/playwright install chromium
+.venv/bin/pytest -q
+```
+
+Нужны Postgres и Redis (`DATABASE_URL`, `REDIS_URL`), затем:
+
+```bash
+.venv/bin/uvicorn app.main:app --reload          # API
+.venv/bin/arq app.worker.WorkerSettings          # воркер
+cd ../frontend && API_URL=http://localhost:8000 npm run dev
+```
+
+## Первичная настройка VPS
+
+1. Установить Docker с compose-плагином и git.
+2. Склонировать репозиторий в `/opt/welegalcompliance`, создать `.env` из `.env.example` с надёжным паролем.
+3. `docker compose up -d --build`
+4. nginx: скопировать `deploy/nginx/welegalcomplience.itb2bhost.ru.conf` в `/etc/nginx/sites-available/`,
+   включить симлинком в `sites-enabled`, `nginx -t && systemctl reload nginx`.
+5. SSL: `certbot --nginx -d welegalcomplience.itb2bhost.ru`
+6. DNS: A-запись `welegalcomplience.itb2bhost.ru` → IP сервера.
+
+## Автодеплой (GitHub Actions)
+
+Push в `main` → тесты → SSH на VPS → `deploy/deploy.sh` (git pull + `docker compose up -d --build`).
+
+Секреты репозитория (Settings → Secrets → Actions):
+
+| Секрет | Значение |
+|---|---|
+| `VPS_HOST` | IP или домен сервера |
+| `VPS_USER` | пользователь для деплоя (в группе `docker`, с правами на `/opt/welegalcompliance`) |
+| `VPS_PORT` | порт SSH (если не 22) |
+| `VPS_SSH_KEY` | приватный ключ (ed25519), публичный — в `~/.ssh/authorized_keys` пользователя |
+| `VPS_KNOWN_HOSTS` | вывод `ssh-keyscan -p <порт> <хост>` |
+
+## Дисклеймер
+
+Заключение формируется автоматически и не является юридической консультацией.
