@@ -1,5 +1,6 @@
 import type { Metadata } from "next";
 import Link from "next/link";
+import { COMPANY } from "@/lib/company";
 import "./globals.css";
 
 export const metadata: Metadata = {
@@ -23,8 +24,13 @@ export default function RootLayout({ children }: { children: React.ReactNode }) 
         <main>{children}</main>
         <footer className="footer">
           <div className="container">
-            © {new Date().getFullYear()} WeLegal Compliance. Результаты проверки носят информационный характер и не
-            являются юридической консультацией.
+            <p>
+              <Link href="/privacy">Политика обработки персональных данных</Link>
+              <Link href="/consent">Согласие на обработку ПДн</Link>
+            </p>
+            © {new Date().getFullYear()} WeLegal Compliance · {COMPANY.name}, ИНН {COMPANY.inn}, {COMPANY.email}. 0+
+            <br />
+            Результаты проверки носят информационный характер и не являются юридической консультацией.
           </div>
         </footer>
       </body>

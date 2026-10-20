@@ -5,7 +5,7 @@ from app.scanner.report import build_report
 from app.scanner.urls import UrlError, normalize_input
 
 POLICY_TEXT = (
-    "Политика в отношении обработки персональных данных. Оператор ООО «Ромашка», ИНН 7701234567. "
+    "Политика в отношении обработки персональных данных. Оператор ООО «Ромашка», ИНН 7707083893. "
     "Цели обработки персональных данных. Правовые основания обработки. Перечень персональных данных. "
     "Категории субъектов персональных данных. Способы обработки. Сроки обработки и хранения. "
     "Порядок уничтожения. Права субъекта персональных данных. Меры по защите персональных данных. "
@@ -25,7 +25,7 @@ def good_site() -> SiteData:
     home = PageData(
         url="https://example.ru/", status=200, lang="ru",
         text="Главная страница компании Ромашка. Мы делаем отличные сайты для бизнеса. Контакты: info@example.ru "
-        "ИНН 7701234567 ОГРН 1027700132195. 12+ " * 5,
+        "ИНН 7707083893 ОГРН 1027700132195. 12+ " * 5,
         links=footer, forms=[form],
     )
     policy = PageData(url="https://example.ru/privacy", status=200, title="Политика конфиденциальности",
@@ -131,3 +131,69 @@ def test_news_politics_link_is_not_policy():
     assert not link_is_policy(Link("https://lenta.ru/rubrics/world/politic/", "Политика"))
     assert link_is_policy(Link("/politika-konfidencialnosti/", "Документ"))
     assert link_is_policy(Link("/x", "Политика обработки персональных данных"))
+
+
+def test_invalid_inn_detected():
+    site = good_site()
+    site.pages[0].text = site.pages[0].text.replace("7707083893", "7707083890")
+    assert by_id(build_report(site))["inn_valid"]["status"] == "fail"
+
+
+def test_newsletter_without_ad_consent():
+    site = good_site()
+    site.pages[0].forms.append(Form(
+        action="/sub", method="post", inputs=[FormInput("email", "email", "Ваш e-mail")],
+        checkboxes=[], text="Подпишитесь на рассылку", links=[], submit="Подписаться",
+    ))
+    assert by_id(build_report(site))["newsletter_consent"]["status"] == "fail"
+
+
+def test_foreign_platform_with_forms():
+    site = good_site()
+    site.pages[0].html = '<script src="https://static.parastorage.com/x.js"></script>'
+    r = build_report(site)
+    assert r["profile"]["platform"]["name"] == "Wix"
+    assert by_id(r)["foreign_platform"]["status"] == "fail"
+
+
+def test_medical_site_profile_and_checks():
+    site = good_site()
+    site.pages[0].text += " Клиника. Приём врача-стоматолога, лечение, диагностика, анализы для пациентов."
+    r = build_report(site)
+    assert any(t["code"] == "medical" for t in r["profile"]["types"])
+    f = by_id(r)
+    assert f["medical_info"]["status"] == "fail"
+    assert f["medical_ads"]["status"] == "warn"
+
+
+def test_rkn_registry_lookup():
+    site = good_site()
+    site.profile = {"rkn": {"loaded": True, "updated": "2026-10-01", "matches": {"7707083893": []}}}
+    assert by_id(build_report(site))["rkn_registry"]["status"] == "fail"
+    site = good_site()
+    site.profile = {"rkn": {"loaded": True, "matches": {"7707083893": [{"reg_number": "77-14-000123"}]}}}
+    assert by_id(build_report(site))["rkn_registry"]["status"] == "pass"
+
+
+def test_penalties_come_from_registry():
+    site = good_site()
+    site.https = HttpsInfo(https_ok=True, http_redirects_to_https=True, hsts=True)
+    site.server_country = "DE"
+    assert "ч. 8, 9 ст. 13.11" in by_id(build_report(site))["hosting"]["penalty"]
+
+
+def test_blocked_page_detection():
+    from app.scanner.crawler import _looks_blocked
+    assert _looks_blocked(PageData(url="https://x.ru/", status=200, text=""))
+    assert _looks_blocked(PageData(url="https://x.ru/", status=200, text="Checking your browser before accessing", links=[Link("/", "")] * 5))
+    assert _looks_blocked(PageData(url="https://x.ru/", status=403, text="Forbidden"))
+    assert not _looks_blocked(good_site().pages[0])
+
+
+@pytest.mark.parametrize("name,expected", [
+    ("microphone", False), ("hotel", False), ("speaker", False),
+    ("user_phone", True), ("firstName", True), ("email", True), ("Ваше имя", True), ("form[phone]", True),
+])
+def test_pd_input_detection(name, expected):
+    from app.scanner.checks.common import input_is_pd
+    assert input_is_pd(FormInput("text", name)) is expected

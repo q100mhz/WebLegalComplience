@@ -12,6 +12,8 @@ x-backend: &backend
       condition: service_healthy
     redis:
       condition: service_started
+  volumes:
+    - appdata:/data
 
 services:
   postgres:
@@ -52,3 +54,4 @@ services:
 
 volumes:
   pgdata:
+  appdata:

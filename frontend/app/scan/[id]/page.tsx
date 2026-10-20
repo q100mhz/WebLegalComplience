@@ -2,6 +2,8 @@
 
 import Link from "next/link";
 import { use, useEffect, useMemo, useState } from "react";
+import FeedbackForm from "@/components/FeedbackForm";
+import ProfileView from "@/components/ProfileView";
 import { getScan } from "@/lib/api";
 import type { Finding, Scan, Status } from "@/lib/types";
 
@@ -97,6 +99,9 @@ function ReportView({ scan }: { scan: Scan }) {
         </div>
       </div>
 
+      {r.profile && <ProfileView profile={r.profile} />}
+
+      <h2 className="findings-title">Результаты проверки</h2>
       <div className="filters">
         <button className={filter === "all" ? "active" : ""} onClick={() => setFilter("all")}>
           Все ({r.findings.length})
@@ -111,7 +116,7 @@ function ReportView({ scan }: { scan: Scan }) {
       </div>
 
       {items.map((f) => (
-        <FindingCard key={f.id} f={f} />
+        <FindingCard key={f.id} f={f} scanId={scan.id} />
       ))}
 
       <div className="cta">
@@ -129,7 +134,7 @@ function ReportView({ scan }: { scan: Scan }) {
   );
 }
 
-function FindingCard({ f }: { f: Finding }) {
+function FindingCard({ f, scanId }: { f: Finding; scanId: string }) {
   const open = f.status === "fail";
   return (
     <details className={`finding ${f.status}`} open={open}>
@@ -172,6 +177,11 @@ function FindingCard({ f }: { f: Finding }) {
               )}
             </dd>
           </>
+        )}
+        {f.status !== "pass" && (
+          <dd>
+            <FeedbackForm scanId={scanId} findingId={f.id} rkn={f.id === "rkn_registry"} />
+          </dd>
         )}
       </dl>
     </details>

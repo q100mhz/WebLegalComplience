@@ -1,17 +1,20 @@
 """Обход сайта настоящим браузером: собираем тексты, ссылки, формы, сетевые запросы и cookies."""
 
 import asyncio
+import hashlib
 import heapq
 import logging
 import re
 from collections.abc import Awaitable, Callable
+from pathlib import Path
 from urllib.parse import urlsplit
 
 import httpx
-from playwright.async_api import Browser, BrowserContext, Page, Route, async_playwright
+from playwright.async_api import Browser, BrowserContext, Route, async_playwright
 from playwright.async_api import TimeoutError as PlaywrightTimeout
 
 from ..config import settings
+from .checks.common import form_is_pd, form_signature
 from .models import Checkbox, Form, FormInput, HttpsInfo, Link, PageData, SiteData
 from .urls import clean_link, is_same_site, resolve_public
 
@@ -57,7 +60,8 @@ EXTRACT_JS = r"""
       if (c) containers.add(c);
     }
   });
-  const forms = [...containers].slice(0, 50).map(f => {
+  const forms = [...containers].slice(0, 50).map((f, idx) => {
+    try { f.setAttribute('data-wlc-form', String(idx)); } catch (e) {}
     const inputs = [...f.querySelectorAll('input, textarea, select')]
       .filter(i => !['hidden', 'submit', 'button', 'checkbox', 'radio', 'image', 'reset'].includes((i.type || '').toLowerCase()))
       .map(i => ({
@@ -69,7 +73,9 @@ EXTRACT_JS = r"""
     }));
     return {
       action: f.getAttribute && f.getAttribute('action') || '', method: (f.getAttribute && f.getAttribute('method') || 'get').toLowerCase(),
-      inputs, checkboxes, text: txt(f).slice(0, 3000),
+      inputs, checkboxes, text: txt(f).slice(0, 3000), index: idx,
+      submit: [...f.querySelectorAll('button, input[type=submit], [role=button], a[class*=btn], [class*=button]')]
+        .map(b => txt(b) || b.value || '').filter(Boolean).join(' | ').slice(0, 300),
       links: [...f.querySelectorAll('a[href]')].map(a => ({ href: a.getAttribute('href') || '', text: txt(a).slice(0, 200) })),
     };
   }).filter(f => f.inputs.length > 0);
@@ -78,6 +84,8 @@ EXTRACT_JS = r"""
     lang: document.documentElement.getAttribute('lang') || '',
     text: (document.body ? document.body.innerText : '').slice(0, 300000),
     links, forms,
+    generator: (document.querySelector('meta[name=generator]') || {}).content || '',
+    scripts: [...document.querySelectorAll('script[src]')].map(s => s.src).slice(0, 200),
     iframes: [...document.querySelectorAll('iframe[src]')].map(i => i.src).slice(0, 100),
     buttons: [...document.querySelectorAll('button, a[role=button], input[type=submit], [class*=btn]')]
       .map(b => txt(b) || b.value || '').filter(Boolean).slice(0, 300),
@@ -149,14 +157,31 @@ async def _guard_route(route: Route) -> None:
     await route.continue_()
 
 
-async def _visit(context: BrowserContext, url: str) -> tuple[PageData, Page | None]:
+class Shots:
+    """Бюджет скриншотов на одно сканирование (доказательства для полного отчёта)."""
+
+    def __init__(self, directory: Path | None, limit: int = 15):
+        self.dir = directory
+        self.left = limit
+        self.seen: set[str] = set()
+        if directory:
+            directory.mkdir(parents=True, exist_ok=True)
+
+    def take(self, key: str) -> str | None:
+        if not self.dir or self.left <= 0 or key in self.seen:
+            return None
+        self.seen.add(key)
+        self.left -= 1
+        return f"{hashlib.sha1(key.encode()).hexdigest()[:16]}.jpg"
+
+
+async def _visit(context: BrowserContext, url: str, shots: Shots, *, keep_html: bool = False) -> PageData:
     page = await context.new_page()
     requests: list[str] = []
+    responses: list = []
     page.on("request", lambda r: requests.append(r.url))
-    status = None
+    page.on("response", lambda r: responses.append(r) if r.request.is_navigation_request() and r.frame == page.main_frame else None)
     try:
-        responses: list = []
-        page.on("response", lambda r: responses.append(r) if r.request.is_navigation_request() and r.frame == page.main_frame else None)
         try:
             resp = await page.goto(url, wait_until="domcontentloaded", timeout=settings.page_timeout_ms)
         except PlaywrightTimeout:
@@ -164,48 +189,77 @@ async def _visit(context: BrowserContext, url: str) -> tuple[PageData, Page | No
             if not responses:
                 raise
             resp = responses[-1]
-        status = resp.status if resp else None
         try:
             await page.wait_for_load_state("networkidle", timeout=4000)
         except Exception:  # noqa: BLE001 — сайты с вечными long-poll запросами
             pass
         await page.wait_for_timeout(1000)  # даём отработать отложенным скриптам и баннерам
         data = await page.evaluate(EXTRACT_JS)
+        if keep_html and len(data["text"]) < 300:
+            # SPA и сайты с JS-проверкой браузера дорисовывают контент позже
+            await page.wait_for_timeout(4000)
+            data = await page.evaluate(EXTRACT_JS)
+        headers = {}
+        if resp:
+            try:
+                headers = {k.lower(): v[:300] for k, v in (await resp.all_headers()).items()}
+            except Exception:  # noqa: BLE001
+                headers = {}
         pd = PageData(
             url=page.url,
-            status=status,
+            status=resp.status if resp else None,
             title=data["title"],
             lang=data["lang"],
             text=data["text"],
             links=[Link(**l) for l in data["links"]],
             forms=[
                 Form(
-                    action=f["action"],
-                    method=f["method"],
+                    action=f["action"], method=f["method"],
                     inputs=[FormInput(**i) for i in f["inputs"]],
                     checkboxes=[Checkbox(**c) for c in f["checkboxes"]],
-                    text=f["text"],
-                    links=[Link(**l) for l in f["links"]],
+                    text=f["text"], links=[Link(**l) for l in f["links"]],
+                    submit=f["submit"], index=f["index"],
                 )
                 for f in data["forms"]
             ],
             iframes=data["iframes"],
             buttons=data["buttons"],
             request_urls=list(dict.fromkeys(requests)),
+            generator=data["generator"][:200],
+            scripts=data["scripts"],
+            headers=headers,
         )
-        return pd, page
+        if keep_html:
+            pd.html = (await page.content())[:400_000]
+            if name := shots.take("page:" + pd.url):
+                await _screenshot(page.screenshot(path=str(shots.dir / name), type="jpeg", quality=70), pd, name)
+        for f in pd.forms:
+            if form_is_pd(f) and (name := shots.take("form:" + form_signature(f))):
+                loc = page.locator(f'[data-wlc-form="{f.index}"]').first
+                await _screenshot(loc.screenshot(path=str(shots.dir / name), type="jpeg", quality=70, timeout=3000), f, name)
+        return pd
     except Exception as e:  # noqa: BLE001
-        await page.close()
         raise RuntimeError(f"{url}: {str(e).splitlines()[0][:200]}") from e
+    finally:
+        await page.close()
 
 
-async def crawl(start_url: str, progress: ProgressCb | None = None) -> SiteData:
+async def _screenshot(coro, target, name: str) -> None:
+    try:
+        await coro
+        target.screenshot = name
+    except Exception:  # noqa: BLE001 — скрытая форма, анимация и т.п.
+        pass
+
+
+async def crawl(start_url: str, progress: ProgressCb | None = None, shots_dir: Path | None = None) -> SiteData:
     host = urlsplit(start_url).hostname or ""
     ok, ip = await resolve_public(host)
     if not ok:
         raise ValueError("Сайт недоступен или указывает на внутренний адрес")
 
     site = SiteData(start_url=start_url, host=host, server_ip=ip)
+    shots = Shots(shots_dir)
     await asyncio.gather(_check_https(host, site.https), _set_geo(site))
 
     async with async_playwright() as pw:
@@ -218,14 +272,17 @@ async def crawl(start_url: str, progress: ProgressCb | None = None) -> SiteData:
             await context.route("**/*", _guard_route)
 
             # 1. Главная в "чистом" контексте — фиксируем cookies и запросы до согласия пользователя
-            home, page = await _visit(context, start_url)
+            home = await _visit(context, start_url, shots, keep_html=True)
+            if _looks_blocked(home):
+                raise BlockedError(
+                    "Сайт не отдал содержимое для проверки: сработала защита от ботов или доступ ограничен. "
+                    "Чтобы не выдавать недостоверное заключение, проверка остановлена."
+                )
             site.pages.append(home)
             site.initial_request_urls = list(home.request_urls)
             site.initial_cookies = [
                 {"name": c["name"], "domain": c["domain"]} for c in await context.cookies()
             ]
-            if page:
-                await page.close()
             if not site.https.https_ok and home.url.startswith("https://") and not _is_cert_error(site.https.cert_error):
                 # httpx мог не дождаться ответа, но браузер открыл сайт по HTTPS
                 site.https.https_ok, site.https.cert_error = True, None
@@ -267,16 +324,14 @@ async def crawl(start_url: str, progress: ProgressCb | None = None) -> SiteData:
                 while queue and len(in_flight) < PARALLEL_TABS and len(site.pages) + len(in_flight) < settings.max_pages:
                     _, depth, _, url = heapq.heappop(queue)
                     if depth <= settings.max_depth:
-                        in_flight[asyncio.create_task(_visit(context, url))] = depth
+                        in_flight[asyncio.create_task(_visit(context, url, shots))] = depth
                 if not in_flight:
                     break
                 done, _ = await asyncio.wait(in_flight, return_when=asyncio.FIRST_COMPLETED)
                 for task in done:
                     depth = in_flight.pop(task)
                     try:
-                        pd, page = task.result()
-                        if page:
-                            await page.close()
+                        pd = task.result()
                     except RuntimeError as e:
                         site.errors.append(str(e))
                         continue
@@ -292,6 +347,25 @@ async def crawl(start_url: str, progress: ProgressCb | None = None) -> SiteData:
         finally:
             await browser.close()
     return site
+
+
+class BlockedError(RuntimeError):
+    pass
+
+
+BLOCK_RE = re.compile(
+    r"checking your browser|just a moment|ddos-guard|access denied|attention required|verify you are human|"
+    r"подтвердите,?\s+что\s+вы\s+не\s+робот|проверка\s+браузера|доступ\s+(запрещ|ограничен)|captcha|cloudflare ray id",
+    re.I,
+)
+
+
+def _looks_blocked(p: PageData) -> bool:
+    if p.status in (401, 403, 429, 503) and len(p.text) < 2000:
+        return True
+    if len(p.text.strip()) < 80 and len(p.links) < 3:
+        return True
+    return len(p.text) < 1500 and bool(BLOCK_RE.search(p.text + " " + p.title))
 
 
 def _is_cert_error(err: str | None) -> bool:

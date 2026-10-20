@@ -1,3 +1,4 @@
+import copy
 from contextlib import asynccontextmanager
 from datetime import timedelta
 from urllib.parse import urlsplit
@@ -5,11 +6,14 @@ from urllib.parse import urlsplit
 from arq import create_pool
 from arq.connections import RedisSettings
 from fastapi import FastAPI, HTTPException, Request
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 from sqlalchemy import select
 
+from .admin import router as admin_router
+from .admin import rules_map
 from .config import settings
-from .db import Scan, SessionLocal, init_db, utcnow
+from .db import Feedback, Scan, SessionLocal, init_db, utcnow
+from .registry import format_penalty
 from .scanner.urls import UrlError, normalize_input, resolve_public, site_key
 
 
@@ -21,7 +25,8 @@ async def lifespan(app: FastAPI):
     await app.state.redis.close()
 
 
-app = FastAPI(title="WeLegalCompliance API", lifespan=lifespan, docs_url="/api/docs", openapi_url="/api/openapi.json")
+app = FastAPI(title="WeLegal Compliance API", lifespan=lifespan, docs_url=None, redoc_url=None, openapi_url=None)
+app.include_router(admin_router)
 
 
 class ScanIn(BaseModel):
@@ -33,17 +38,17 @@ def client_ip(request: Request) -> str:
     return request.headers.get("x-real-ip") or (request.client.host if request.client else "unknown")
 
 
-async def check_rate_limit(request: Request, ip: str) -> None:
+async def check_rate_limit(request: Request, ip: str, scope: str = "rl", limit: int | None = None) -> None:
     redis = request.app.state.redis
-    key = f"rl:{ip}"
+    key = f"{scope}:{ip}"
     n = await redis.incr(key)
     if n == 1:
         await redis.expire(key, 3600)
-    if n > settings.rate_limit_per_hour:
-        raise HTTPException(429, "Слишком много проверок. Попробуйте через час.")
+    if n > (limit or settings.rate_limit_per_hour):
+        raise HTTPException(429, "Слишком много запросов. Попробуйте через час.")
 
 
-def public_view(scan: Scan) -> dict:
+def public_view(scan: Scan, rules: dict[str, dict] | None = None) -> dict:
     """Открытая версия отчёта. Полные доказательства — в будущем личном кабинете."""
     data = {
         "id": scan.id,
@@ -59,11 +64,24 @@ def public_view(scan: Scan) -> dict:
         "report": None,
     }
     if scan.result:
-        r = dict(scan.result)
+        r = copy.deepcopy(scan.result)
+        rules = rules or {}
         r["findings"] = [
-            {**f, "evidence": f["evidence"][:3], "evidence_total": len(f["evidence"])} for f in r["findings"]
+            {
+                **f,
+                "evidence": f["evidence"][:3],
+                "evidence_total": len(f["evidence"]),
+                # штрафы всегда по актуальному реестру из админки
+                "penalty": format_penalty(rules[f["id"]]) if f["id"] in rules and f["status"] in ("fail", "warn")
+                else f.get("penalty", ""),
+            }
+            for f in r["findings"]
         ]
         r.pop("errors", None)
+        for p in r.get("pages", []):
+            p.pop("screenshot", None)
+        for f in (r.get("profile") or {}).get("forms", []):
+            f.pop("screenshot", None)
         data["report"] = r
     return data
 
@@ -114,5 +132,30 @@ async def get_scan(scan_id: str):
         scan = await db.get(Scan, scan_id)
     if not scan:
         raise HTTPException(404, "Проверка не найдена")
-    return public_view(scan)
+    return public_view(scan, await rules_map())
+
+
+class FeedbackIn(BaseModel):
+    finding_id: str = Field(max_length=64)
+    kind: str = Field(pattern="^(false_positive|rkn_claim|other)$")
+    comment: str = Field(default="", max_length=2000)
+    contact: str = Field(default="", max_length=255)
+    consent: bool = False
+
+
+@app.post("/api/scans/{scan_id}/feedback", status_code=201)
+async def create_feedback(scan_id: str, body: FeedbackIn, request: Request):
+    if body.contact.strip() and not body.consent:
+        raise HTTPException(422, "Чтобы оставить контакт, нужно согласие на обработку персональных данных")
+    if body.kind == "rkn_claim" and not body.comment.strip():
+        raise HTTPException(422, "Укажите номер уведомления или регистрационный номер в реестре")
+    ip = client_ip(request)
+    await check_rate_limit(request, ip, scope="fb", limit=30)
+    async with SessionLocal() as db:
+        if not await db.get(Scan, scan_id):
+            raise HTTPException(404, "Проверка не найдена")
+        db.add(Feedback(scan_id=scan_id, finding_id=body.finding_id, kind=body.kind, comment=body.comment.strip(),
+                        contact=body.contact.strip(), client_ip=ip))
+        await db.commit()
+    return {"ok": True}
 

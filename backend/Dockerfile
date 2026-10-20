@@ -7,7 +7,8 @@ WORKDIR /app
 COPY requirements.txt .
 RUN pip install -r requirements.txt \
  && playwright install --with-deps chromium \
- && useradd -m -u 10001 app
+ && useradd -m -u 10001 app \
+ && mkdir -p /data && chown app:app /data
 
 COPY app ./app
 USER app

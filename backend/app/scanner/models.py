@@ -33,6 +33,9 @@ class Form:
     checkboxes: list[Checkbox]
     text: str
     links: list[Link]
+    submit: str = ""
+    index: int = -1
+    screenshot: str | None = None
 
 
 @dataclass
@@ -47,6 +50,11 @@ class PageData:
     iframes: list[str] = field(default_factory=list)
     buttons: list[str] = field(default_factory=list)
     request_urls: list[str] = field(default_factory=list)
+    generator: str = ""
+    scripts: list[str] = field(default_factory=list)
+    headers: dict[str, str] = field(default_factory=dict)
+    html: str = ""  # сохраняется только для главной — нужен для определения CMS
+    screenshot: str | None = None
 
 
 @dataclass
@@ -71,6 +79,7 @@ class SiteData:
     server_ip: str | None = None
     server_country: str | None = None
     errors: list[str] = field(default_factory=list)
+    profile: dict = field(default_factory=dict)
 
     @property
     def home(self) -> PageData | None:

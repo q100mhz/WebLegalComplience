@@ -15,9 +15,10 @@ POLICY_HREF_RE = re.compile(
 CONSENT_TEXT_RE = re.compile(r"согласи\w*\s+(на\s+)?(обработк|получени)|consent", re.I)
 CONSENT_HREF_RE = re.compile(r"soglas|consent|agreement-pd|personal-data-agree", re.I)
 
+# Слово должно начинаться с маркера: «microphone» и «hotel» — не ПДн, «user_phone» и «firstName» — ПДн
 PD_INPUT_RE = re.compile(
-    r"e-?mail|mail|phone|tel|fio|name|surname|имя|фамил|телефон|почт|адрес|address|паспорт|"
-    r"birth|рожд|snils|снилс|inn|инн",
+    r"(?<![a-zа-яё])(e-?mail|mail|phone|tel|fio|name|surname|имя|фамил|телефон|почт|адрес|address|паспорт|"
+    r"birth|рожд|snils|снилс|inn|инн)",
     re.I,
 )
 SEARCH_RE = re.compile(r"^(q|s|search|query|text|поиск|keyword)s?$", re.I)
@@ -56,7 +57,8 @@ def input_is_pd(i) -> bool:
         return True
     if i.type == "search" or SEARCH_RE.match(i.name or ""):
         return False
-    return bool(PD_INPUT_RE.search(f"{i.name} {i.placeholder} {i.autocomplete}"))
+    hay = re.sub(r"([a-z])([A-Z])", r"\1 \2", f"{i.name} {i.placeholder} {i.autocomplete}")
+    return bool(PD_INPUT_RE.search(hay))
 
 
 def form_is_pd(f: Form) -> bool:

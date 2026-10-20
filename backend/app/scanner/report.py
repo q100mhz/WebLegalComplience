@@ -2,8 +2,10 @@
 
 import logging
 
+from ..registry import RULES_BY_ID, format_penalty
 from .checks import CHECKS
 from .models import Finding, SiteData
+from .profile import build_profile
 
 log = logging.getLogger(__name__)
 
@@ -22,12 +24,14 @@ def run_checks(site: SiteData) -> list[Finding]:
     findings = []
     for check in CHECKS:
         try:
-            f = check(site)
+            res = check(site)
         except Exception:  # одна сломанная проверка не должна ронять весь отчёт
             log.exception("check %s failed", check.__name__)
             continue
-        if f:
-            findings.append(f)
+        for f in res if isinstance(res, list) else [res]:
+            if f:
+                f.penalty = format_penalty(RULES_BY_ID.get(f.id, {})) if f.status in ("fail", "warn") else ""
+                findings.append(f)
     findings.sort(key=lambda f: (ORDER[f.status], SEV[f.severity]))
     return findings
 
@@ -45,6 +49,8 @@ def grade(value: int) -> str:
 
 
 def build_report(site: SiteData) -> dict:
+    """site.profile может быть частично заполнен заранее (например, данными реестра РКН)."""
+    site.profile = {**build_profile(site), **site.profile}
     findings = run_checks(site)
     value = score(findings)
     counts = {s: sum(1 for f in findings if f.status == s) for s in ORDER}
@@ -53,7 +59,9 @@ def build_report(site: SiteData) -> dict:
         "grade": grade(value),
         "counts": counts,
         "final_url": site.home.url if site.home else site.start_url,
-        "pages": [{"url": p.url, "title": p.title[:200], "status": p.status} for p in site.pages],
+        "profile": {k: v for k, v in site.profile.items() if k != "rkn"},
+        "pages": [{"url": p.url, "title": p.title[:200], "status": p.status, "screenshot": p.screenshot}
+                  for p in site.pages],
         "server": {"ip": site.server_ip, "country": site.server_country},
         "errors": site.errors[:20],
         "findings": [f.to_dict() for f in findings],

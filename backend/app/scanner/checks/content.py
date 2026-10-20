@@ -92,7 +92,6 @@ def check_meta_links(site: SiteData) -> Finding:
     ev = [f"{short(u, 80)} → {', '.join(v)}" for u, v in list(pages_with.items())[:8]]
     return Finding(
         **base, status="warn", severity="medium", evidence=ev,
-        penalty="ст. 20.3 КоАП РФ — практика неоднозначна, возможны предписания",
         summary=f"На {len(pages_with)} стр. есть ссылки на Instagram/Facebook без пометки о том, что Meta признана "
         "экстремистской организацией и запрещена в РФ.",
         recommendation="Уберите иконки и ссылки на соцсети Meta либо добавьте сноску: «Instagram/Facebook — продукты "
@@ -108,7 +107,6 @@ def check_ad_marking(site: SiteData) -> Finding:
     base = dict(
         id="ad_marking", category="Реклама", title="Маркировка интернет-рекламы",
         law="38-ФЗ «О рекламе», ст. 18.1",
-        penalty="ст. 14.3, 14.63 КоАП РФ: для юрлиц до 500 000 ₽",
     )
     if not ad_networks and not erid_links:
         return Finding(**base, status="info", severity="low",
@@ -149,7 +147,6 @@ def check_ecommerce(site: SiteData) -> Finding | None:
     base = dict(
         id="ecommerce", category="Защита прав потребителей", title="Дистанционная торговля",
         law="ЗоЗПП, ст. 8–10, 26.1; Правила продажи товаров (ПП РФ № 2463)",
-        penalty="ч. 1 ст. 14.8 КоАП РФ: для юрлиц 5 000 – 10 000 ₽",
     )
     if not missing:
         return Finding(**base, status="pass", severity="low",
@@ -170,7 +167,6 @@ def check_age_rating(site: SiteData) -> Finding:
     base = dict(
         id="age_rating", category="Информация и технологии", title="Возрастная маркировка",
         law="436-ФЗ «О защите детей от информации…», ст. 6, 12",
-        penalty="ч. 2 ст. 6.17 КоАП РФ: для юрлиц 20 000 – 200 000 ₽",
     )
     if found:
         return Finding(**base, status="pass", severity="low", evidence=[found], summary=f"Найден знак возрастной категории: {found}.")
