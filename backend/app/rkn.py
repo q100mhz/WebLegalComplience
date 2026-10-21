@@ -42,23 +42,43 @@ def _local(tag: str) -> str:
     return tag.rsplit("}", 1)[-1].lower()
 
 
-async def _find_data_url(client: httpx.AsyncClient) -> str:
-    base = settings.rkn_opendata_url.rstrip("/") + "/"
+DATASET_RE = re.compile(r'href="([^"]*7705846236-[^"/]*Operator[^"/]*/?)"', re.I)
+
+
+async def _dataset_pages(client: httpx.AsyncClient) -> list[str]:
+    """Адрес набора из настроек, а если он устарел — найденные в каталоге rkn.gov.ru/opendata/."""
+    pages = [settings.rkn_opendata_url.rstrip("/") + "/"]
     try:
-        r = await client.get(base + "meta.csv")
-        r.raise_for_status()
-        for row in csv.reader(io.StringIO(r.content.decode("utf-8-sig", errors="replace"))):
-            for cell in row:
-                if re.search(r"data-\d{8}.*\.(zip|xml)", cell):
-                    return cell.strip()
+        r = await client.get("https://rkn.gov.ru/opendata/")
+        found = [str(httpx.URL("https://rkn.gov.ru/opendata/").join(h)).rstrip("/") + "/"
+                 for h in DATASET_RE.findall(r.text)]
+        pages += [u for u in dict.fromkeys(found) if u not in pages]
     except httpx.HTTPError:
-        log.info("meta.csv not available, falling back to HTML page")
-    r = await client.get(base)
-    r.raise_for_status()
-    links = re.findall(r'href="([^"]*data-\d{8}[^"]*\.(?:zip|xml))"', r.text)
-    if not links:
-        raise RuntimeError("На странице открытых данных РКН не найдена ссылка на файл реестра")
-    return str(httpx.URL(base).join(sorted(links)[-1]))
+        log.info("RKN opendata catalog not available")
+    return pages
+
+
+async def _find_data_url(client: httpx.AsyncClient) -> str:
+    tried = []
+    for base in await _dataset_pages(client):
+        tried.append(base)
+        try:
+            r = await client.get(base + "meta.csv")
+            if r.status_code == 200:
+                for row in csv.reader(io.StringIO(r.content.decode("utf-8-sig", errors="replace"))):
+                    for cell in row:
+                        if re.search(r"data-\d{8}.*\.(zip|xml)", cell):
+                            return cell.strip()
+            r = await client.get(base)
+            if r.status_code != 200:
+                continue
+            links = re.findall(r'href="([^"]*data-\d{8}[^"]*\.(?:zip|xml))"', r.text)
+            if links:
+                return str(httpx.URL(base).join(sorted(links)[-1]))
+        except httpx.HTTPError as e:
+            log.info("RKN dataset page %s failed: %s", base, e)
+    raise RuntimeError("Не найден файл реестра операторов ПДн. Проверены адреса: " + ", ".join(tried)
+                       + ". Укажите актуальный адрес набора в RKN_OPENDATA_URL (.env).")
 
 
 def _parse(xml_stream) -> Iterator[list[dict]]:

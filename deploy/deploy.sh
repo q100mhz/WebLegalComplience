@@ -13,7 +13,7 @@ docker image prune -f >/dev/null
 
 # Проверяем, что API поднялось
 for i in $(seq 1 30); do
-  if curl -fsS "http://127.0.0.1:${API_PORT:-8100}/api/health" >/dev/null; then
+  if curl -fs "http://127.0.0.1:${API_PORT:-8100}/api/health" >/dev/null; then
     echo "Deploy OK"; exit 0
   fi
   sleep 2
