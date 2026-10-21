@@ -25,7 +25,7 @@ async def lifespan(app: FastAPI):
     await app.state.redis.close()
 
 
-app = FastAPI(title="WeLegal Compliance API", lifespan=lifespan, docs_url=None, redoc_url=None, openapi_url=None)
+app = FastAPI(title="WebLegalCompliance API", lifespan=lifespan, docs_url=None, redoc_url=None, openapi_url=None)
 app.include_router(admin_router)
 
 

@@ -2,7 +2,7 @@ import type { Metadata } from "next";
 import Link from "next/link";
 import { COMPANY } from "@/lib/company";
 
-export const metadata: Metadata = { title: "Политика обработки персональных данных — WeLegal Compliance" };
+export const metadata: Metadata = { title: "Политика обработки персональных данных — WebLegalCompliance" };
 
 export default function Privacy() {
   const c = COMPANY;

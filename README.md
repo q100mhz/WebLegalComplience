@@ -1,4 +1,4 @@
-# WeLegal Compliance
+# WebLegalCompliance
 
 Онлайн-сервис автоматической проверки сайтов на соответствие законодательству РФ.
 Прод: https://weblegalcompliance.itb2bhost.ru

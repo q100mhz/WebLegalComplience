@@ -4,7 +4,7 @@ import { COMPANY } from "@/lib/company";
 import "./globals.css";
 
 export const metadata: Metadata = {
-  title: "WeLegal Compliance — проверка сайта на соответствие законодательству РФ",
+  title: "WebLegalCompliance — проверка сайта на соответствие законодательству РФ",
   description:
     "Бесплатная автоматическая проверка сайта: 152-ФЗ о персональных данных, cookies, иностранные сервисы, маркировка рекламы, права потребителей.",
 };
@@ -16,7 +16,7 @@ export default function RootLayout({ children }: { children: React.ReactNode }) 
         <header className="header">
           <div className="container">
             <Link href="/" className="logo">
-              WeLegal<span>Compliance</span>
+              WebLegal<span>Compliance</span>
             </Link>
             <nav>Проверка сайтов по законодательству РФ</nav>
           </div>
@@ -28,7 +28,7 @@ export default function RootLayout({ children }: { children: React.ReactNode }) 
               <Link href="/privacy">Политика обработки персональных данных</Link>
               <Link href="/consent">Согласие на обработку ПДн</Link>
             </p>
-            © {new Date().getFullYear()} WeLegal Compliance · {COMPANY.name}, ИНН {COMPANY.inn}, {COMPANY.email}. 0+
+            © {new Date().getFullYear()} WebLegalCompliance · {COMPANY.name}, ИНН {COMPANY.inn}, {COMPANY.email}. 0+
             <br />
             Результаты проверки носят информационный характер и не являются юридической консультацией.
           </div>

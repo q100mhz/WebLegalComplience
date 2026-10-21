@@ -21,7 +21,10 @@ done
 python3 - "$J" <<'PY'
 import json, sys
 d = json.load(open(sys.argv[1]))
-assert d["status"] == "done", d.get("error")
+if d["status"] != "done":
+    print("СКАНИРОВАНИЕ НЕ УДАЛОСЬ:", d.get("error"))
+    print("Подробности: docker compose logs --tail=50 worker")
+    sys.exit(1)
 r = d["report"]
 print("score", r["score"], r["counts"], "| тип:", r["profile"]["primary_type"], "| findings:", len(r["findings"]))
 PY

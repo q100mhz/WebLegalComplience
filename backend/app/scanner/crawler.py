@@ -274,6 +274,8 @@ async def crawl(start_url: str, progress: ProgressCb | None = None, shots_dir: P
             # 1. Главная в "чистом" контексте — фиксируем cookies и запросы до согласия пользователя
             home = await _visit(context, start_url, shots, keep_html=True)
             if _looks_blocked(home):
+                log.warning("blocked: url=%s status=%s title=%r text_len=%s links=%s text=%r",
+                            home.url, home.status, home.title[:100], len(home.text), len(home.links), home.text[:300])
                 raise BlockedError(
                     "Сайт не отдал содержимое для проверки: сработала защита от ботов или доступ ограничен. "
                     "Чтобы не выдавать недостоверное заключение, проверка остановлена."
