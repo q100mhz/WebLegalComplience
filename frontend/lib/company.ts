@@ -6,6 +6,6 @@ export const COMPANY = {
   ogrn: "[ОГРН / ОГРНИП]",
   address: "[Адрес]",
   email: "[e-mail для обращений по персональным данным]",
-  site: "https://welegalcompliance.itb2bhost.ru",
+  site: "https://weblegalcompliance.itb2bhost.ru",
   policyDate: "20.10.2026",
 };

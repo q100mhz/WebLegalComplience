@@ -52,6 +52,10 @@ jobs:
           SSH_PORT: ${{ secrets.VPS_PORT || '22' }}
           KNOWN_HOSTS: ${{ secrets.VPS_KNOWN_HOSTS }}
         run: |
+          if [ -z "$SSH_HOST" ] || [ -z "$SSH_KEY" ]; then
+            echo "::warning::Секреты VPS_HOST / VPS_SSH_KEY не настроены — деплой пропущен"
+            exit 0
+          fi
           mkdir -p ~/.ssh
           echo "$SSH_KEY" > ~/.ssh/id_ed25519
           chmod 600 ~/.ssh/id_ed25519

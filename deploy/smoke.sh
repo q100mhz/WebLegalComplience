@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
 # Сквозная проверка после деплоя: API, сканирование, админка.
-#   bash deploy/smoke.sh [https://welegalcompliance.itb2bhost.ru]
+#   bash deploy/smoke.sh [https://weblegalcompliance.itb2bhost.ru]
 set -euo pipefail
-BASE="${1:-https://welegalcompliance.itb2bhost.ru}"
+BASE="${1:-https://weblegalcompliance.itb2bhost.ru}"
 cd "$(dirname "$0")/.."
 set -a; [ -f .env ] && . ./.env; set +a
 J=$(mktemp); trap 'rm -f $J' EXIT

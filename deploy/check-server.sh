@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Диагностика VPS перед установкой. Ничего не меняет — только читает.
 #   bash check-server.sh
-DOMAIN="${DOMAIN:-welegalcompliance.itb2bhost.ru}"
+DOMAIN="${DOMAIN:-weblegalcompliance.itb2bhost.ru}"
 PORTS="${PORTS:-80 443 3100 8100}"
 
 ok()   { printf '  \033[32m✔\033[0m %s\n' "$*"; }

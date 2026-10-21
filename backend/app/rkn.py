@@ -25,6 +25,12 @@ from .db import RknOperator, SessionLocal, kv_get, kv_set
 
 log = logging.getLogger(__name__)
 KV_KEY = "rkn_import"
+# Сайт РКН отвечает 403 на запросы с «ботовым» User-Agent — представляемся обычным браузером
+BROWSER_HEADERS = {
+    "User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/140.0.0.0 Safari/537.36",
+    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+    "Accept-Language": "ru-RU,ru;q=0.9",
+}
 BATCH = 5000
 
 NAME_TAGS = ("name_full", "name", "fullname", "operator_name")
@@ -85,7 +91,7 @@ async def import_registry(ctx=None) -> dict:
     path = tmp_dir / "registry.download"
     try:
         async with httpx.AsyncClient(timeout=httpx.Timeout(60, read=600), follow_redirects=True,
-                                     headers={"User-Agent": settings.user_agent}) as client:
+                                     headers=BROWSER_HEADERS) as client:
             url = await _find_data_url(client)
             log.info("downloading RKN registry %s", url)
             async with client.stream("GET", url) as r:

@@ -1,7 +1,7 @@
 # WeLegal Compliance
 
 Онлайн-сервис автоматической проверки сайтов на соответствие законодательству РФ.
-Прод: https://welegalcompliance.itb2bhost.ru
+Прод: https://weblegalcompliance.itb2bhost.ru
 
 Пользователь вводит адрес сайта → воркер обходит до 30 страниц настоящим браузером (Playwright/Chromium) →
 движок правил формирует заключение: нарушения, риски, статьи закона, ориентировочные штрафы.
@@ -76,10 +76,10 @@ cd ../frontend && API_URL=http://localhost:8000 npm run dev
 1. Установить Docker с compose-плагином и git.
 2. Склонировать репозиторий в `/opt/welegalcompliance`, создать `.env` из `.env.example` с надёжным паролем.
 3. `docker compose up -d --build`
-4. nginx: скопировать `deploy/nginx/welegalcompliance.itb2bhost.ru.conf` в `/etc/nginx/sites-available/`,
+4. nginx: скопировать `deploy/nginx/weblegalcompliance.itb2bhost.ru.conf` в `/etc/nginx/sites-available/`,
    включить симлинком в `sites-enabled`, `nginx -t && systemctl reload nginx`.
-5. SSL: `certbot --nginx -d welegalcompliance.itb2bhost.ru`
-6. DNS: A-запись `welegalcompliance.itb2bhost.ru` → IP сервера.
+5. SSL: `certbot --nginx -d weblegalcompliance.itb2bhost.ru`
+6. DNS: A-запись `weblegalcompliance.itb2bhost.ru` → IP сервера.
 7. Проверка: `bash deploy/smoke.sh` — запускает тестовое сканирование и проверяет админку.
 
 ## Автодеплой (GitHub Actions)
