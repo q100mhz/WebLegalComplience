@@ -7,7 +7,7 @@
 import re
 from collections import Counter
 
-from .checks.common import all_text, form_is_pd, input_is_pd
+from .checks.common import all_text, field_label, form_is_pd, form_signature, input_is_pd, is_service_form
 from .models import Form, SiteData
 from .services_db import match_service
 
@@ -20,17 +20,20 @@ SITE_TYPES: dict[str, tuple[str, str, int]] = {
     "finance": ("Финансы", r"кредит|займ|микрозайм|ставка\s+от|инвестиц|брокер|страхован|ипотек|процент\w*\s+годовых|вклад", 4),
     "realestate": ("Недвижимость", r"новостройк|квартир[аы]|застройщик|жилой\s+комплекс|планировк|ипотек", 4),
     "media": ("СМИ / медиа", r"новост|редакци|главный\s+редактор|регистрации\s+сми|эл\s*№\s*фс|статьи|подписаться\s+на\s+новости", 4),
-    "saas": ("Онлайн-сервис / SaaS", r"тариф|бесплатный\s+период|попробовать\s+бесплатно|личный\s+кабинет|\bapi\b|интеграци|регистрация", 4),
+    "saas": ("Онлайн-сервис / SaaS", r"тариф|бесплатный\s+период|попробовать\s+бесплатно|личный\s+кабинет|\bapi\b|интеграци|регистрация|"
+             r"конструктор\w*|создать\s+сайт|no-?code|платформ[аеуы]\b|облачн\w+\s+сервис|начать\s+бесплатно|подключить\s+бесплатно", 4),
     "food": ("Еда / рестораны", r"доставка\s+еды|меню|пицц|суши|роллы|ресторан|кафе|бронирование\s+стол", 3),
-    "travel": ("Туризм / отели", r"бронирован|номер[аов]?\s|отел|тур[ыа]?\s|турагент|путешеств|заселени", 4),
+    "travel": ("Туризм / отели", r"\bбронирован|\bномер\w*\s+(в\s+)?(отел|гостиниц)|\bотел[ьяеию]\w*|\bгостиниц|\bтур(ы|ов)?\b|\bтурагент|\bпутешеств|\bзаселени", 4),
 }
 
 # Сигналы товаров с ограничениями дистанционной продажи
 RESTRICTED = {
-    "Алкоголь": r"\b(вино|вина|водк[аи]|коньяк|виски|ликёр|ликер|шампанск|пиво|алкоголь)\w*",
-    "Табак и никотин": r"\b(сигарет|вейп|электронн\w+\s+сигарет|под-систем|pod-систем|жидкост\w+\s+для\s+(вейп|электрон)|снюс|никотин|табак)\w*",
+    "Алкоголь": r"\b(вин[оа]|водк[аи]|коньяк\w*|виски|ликё?е?р\w*|шампанское|пиво|пива|алкоголь\w*)\b",
+    "Табак и никотин": r"\b(сигарет\w*|вейп\w*|под-систем\w*|pod-систем\w*|жидкост\w+\s+для\s+(вейп|электрон)\w*|снюс\w*|никотин\w*|табак\w*)\b",
     "Рецептурные лекарства": r"рецептурн\w+\s+(препарат|лекарств)",
 }
+
+PRICE_CTX_RE = re.compile(r"\d[\d\s]{0,9}(?:[.,]\d{1,2})?\s?(₽|руб)|в\s+корзину|купить|заказать", re.I)
 
 # Платформы: (название, признак в HTML/скриптах/заголовках, иностранная?)
 PLATFORMS: list[tuple[str, str, bool]] = [
@@ -96,11 +99,15 @@ PAYMENT_HOSTS = {
 }
 
 
-def classify_form(f: Form) -> str:
+def classify_form(f: Form, page_url: str = "") -> str:
     text = f"{f.submit} {f.text[:600]}"
     names = " ".join(f"{i.type} {i.name} {i.placeholder}" for i in f.inputs).lower()
     if any(i.type == "password" for i in f.inputs):
         return "registration" if re.search(FORM_KINDS[1][2], text, re.I) else "login"
+    if not form_is_pd(f):
+        return "search"
+    if is_service_form(f, page_url):
+        return "service"
     if CARD_RE.search(names):
         return "payment"
     for code, _, rx in FORM_KINDS:
@@ -116,7 +123,9 @@ def classify_form(f: Form) -> str:
     return "other" if form_is_pd(f) else "search"
 
 
-FORM_KIND_NAMES = {code: name for code, name, _ in FORM_KINDS} | {"search": "Поиск", "other": "Прочая форма"}
+FORM_KIND_NAMES = {code: name for code, name, _ in FORM_KINDS} | {
+    "search": "Поиск", "other": "Прочая форма", "service": "Служебная (восстановление пароля, управление подпиской)",
+}
 
 
 def build_profile(site: SiteData) -> dict:
@@ -124,11 +133,19 @@ def build_profile(site: SiteData) -> dict:
     titles = " ".join(p.title for p in site.pages)
     hay = f"{titles}\n{text}\n" + " ".join(b for p in site.pages for b in p.buttons)
 
+    # Тип бизнеса определяет то, что сайт говорит о себе на главной, в заголовках и меню.
+    # Глубокие страницы (статьи, FAQ, шаблоны) только подтверждают: иначе блог про путешествия
+    # или конструктор сайтов с шаблонами «турагентства» превращается в «Туризм».
+    home_page = site.home
+    primary = "\n".join([home_page.text[:15000] if home_page else "", titles] +
+                        [l.text for l in (home_page.links if home_page else [])])
     types = []
     for code, (name, rx, need) in SITE_TYPES.items():
-        hits = Counter(m.group(0).lower() for m in re.finditer(rx, hay, re.I))
-        if len(hits) >= need:
-            types.append({"code": code, "name": name, "score": sum(min(v, 5) for v in hits.values()),
+        hits = Counter(re.sub(r"\s+", " ", m.group(0).lower()).strip() for m in re.finditer(rx, hay, re.I))
+        primary_hits = {re.sub(r"\s+", " ", m.group(0).lower()).strip() for m in re.finditer(rx, primary, re.I)}
+        if len(hits) >= need and len(primary_hits) >= 2:
+            types.append({"code": code, "name": name,
+                          "score": sum(min(v, 5) for v in hits.values()) + 5 * len(primary_hits),
                           "signals": [k for k, _ in hits.most_common(5)]})
     types.sort(key=lambda t: -t["score"])
 
@@ -154,24 +171,34 @@ def build_profile(site: SiteData) -> dict:
     seen = set()
     for p in site.pages:
         for f in p.forms:
-            kind = classify_form(f)
-            key = (kind, tuple(sorted(i.name for i in f.inputs)))
+            kind = classify_form(f, p.url)
+            key = (kind, form_signature(f), tuple(c.label[:60] for c in f.checkboxes))
             if kind == "search" or key in seen:
                 continue
             seen.add(key)
             forms.append({
                 "kind": kind, "kind_name": FORM_KIND_NAMES.get(kind, kind), "page": p.url,
-                "fields": [i.placeholder or i.name or i.type for i in f.inputs][:8],
+                "fields": [field_label(i) for i in f.inputs][:8],
                 "pd": form_is_pd(f),
                 "special": bool(SPECIAL_RE.search(f.text + " " + " ".join(i.name + " " + i.placeholder for i in f.inputs))),
                 "card": bool(CARD_RE.search(" ".join(f"{i.name} {i.placeholder} {i.autocomplete}" for i in f.inputs))),
+                "service": kind in ("login", "service"),
                 "consent_checkbox": any(re.search(r"согла|персональн", c.label, re.I) for c in f.checkboxes),
                 "ad_consent_checkbox": any(re.search(r"реклам|рассылк|маркетинг|новост", c.label, re.I) for c in f.checkboxes),
                 "screenshot": f.screenshot,
             })
 
-    restricted = {name: sorted({m.group(0).lower() for m in re.finditer(rx, hay, re.I)})[:5]
-                  for name, rx in RESTRICTED.items() if re.search(rx, hay, re.I)}
+    # Товар — только упоминание рядом с ценой или кнопкой покупки (не правила, не статьи о запретах)
+    restricted = {}
+    for name, rx in RESTRICTED.items():
+        found = set()
+        for p in site.pages:
+            for m in re.finditer(rx, p.text, re.I):
+                window = p.text[max(0, m.start() - 150):m.end() + 150]
+                if PRICE_CTX_RE.search(window):
+                    found.add(m.group(0).lower())
+        if found:
+            restricted[name] = sorted(found)[:5]
 
     return {
         "types": types[:4],
@@ -185,6 +212,3 @@ def build_profile(site: SiteData) -> dict:
         "pages_count": len(site.pages),
     }
 
-
-def has_type(site: SiteData, code: str) -> bool:
-    return any(t["code"] == code for t in site.profile.get("types", []))

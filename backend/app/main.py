@@ -63,7 +63,7 @@ def public_view(scan: Scan, rules: dict[str, dict] | None = None) -> dict:
         "error": scan.error,
         "report": None,
     }
-    if scan.result:
+    if scan.result and scan.status == "done":
         r = copy.deepcopy(scan.result)
         rules = rules or {}
         r["findings"] = [
@@ -77,7 +77,8 @@ def public_view(scan: Scan, rules: dict[str, dict] | None = None) -> dict:
             }
             for f in r["findings"]
         ]
-        r.pop("errors", None)
+        for k in ("errors", "timing", "stats"):
+            r.pop(k, None)
         for p in r.get("pages", []):
             p.pop("screenshot", None)
         for f in (r.get("profile") or {}).get("forms", []):

@@ -60,10 +60,14 @@ def build_report(site: SiteData) -> dict:
         "counts": counts,
         "final_url": site.home.url if site.home else site.start_url,
         "profile": {k: v for k, v in site.profile.items() if k != "rkn"},
-        "pages": [{"url": p.url, "title": p.title[:200], "status": p.status, "screenshot": p.screenshot}
+        "pages": [{"url": p.url, "title": p.title[:200], "status": p.status, "screenshot": p.screenshot,
+                   "via": p.via, "text_len": len(p.text)}
                   for p in site.pages],
         "server": {"ip": site.server_ip, "country": site.server_country},
         "errors": site.errors[:20],
+        "stats": site.stats,
+        "timing": site.timing,
+        "truncated": site.truncated,
         "findings": [f.to_dict() for f in findings],
         "disclaimer": DISCLAIMER,
     }

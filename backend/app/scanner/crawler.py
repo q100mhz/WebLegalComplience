@@ -1,10 +1,11 @@
-"""Обход сайта настоящим браузером: собираем тексты, ссылки, формы, сетевые запросы и cookies."""
+"""Обход сайта: главная — браузером (трекеры, cookies до согласия), остальное — HTTP или браузером."""
 
 import asyncio
 import hashlib
 import heapq
 import logging
 import re
+import time
 from collections.abc import Awaitable, Callable
 from pathlib import Path
 from urllib.parse import urlsplit
@@ -15,14 +16,16 @@ from playwright.async_api import TimeoutError as PlaywrightTimeout
 
 from ..config import settings
 from .checks.common import form_is_pd, form_signature
+from .fastfetch import PageGone, http_page
+from .services_db import match_service
 from .models import Checkbox, Form, FormInput, HttpsInfo, Link, PageData, SiteData
 from .urls import clean_link, is_same_site, resolve_public
 
 log = logging.getLogger(__name__)
 
 ProgressCb = Callable[[int, str], Awaitable[None]]
+HTTP_PARALLEL = 6  # одновременных HTTP-загрузок в гибридном режиме
 
-PARALLEL_TABS = 3
 
 DOC_EXT = (".pdf", ".doc", ".docx", ".rtf", ".odt")
 SKIP_EXT = (
@@ -85,6 +88,7 @@ EXTRACT_JS = r"""
     text: (document.body ? document.body.innerText : '').slice(0, 300000),
     links, forms,
     generator: (document.querySelector('meta[name=generator]') || {}).content || '',
+    consentPopup: !!document.querySelector('[data-bx-user-consent], .main-user-consent-request, [class*="main-user-consent-request"]'),
     scripts: [...document.querySelectorAll('script[src]')].map(s => s.src).slice(0, 200),
     iframes: [...document.querySelectorAll('iframe[src]')].map(i => i.src).slice(0, 100),
     buttons: [...document.querySelectorAll('button, a[role=button], input[type=submit], [class*=btn]')]
@@ -157,6 +161,16 @@ async def _guard_route(route: Route) -> None:
     await route.continue_()
 
 
+async def _inner_route(route: Route) -> None:
+    """Внутренние страницы: трекеры и реклама не рисуют контент — не грузим их.
+    Сам запрос при этом уже зафиксирован событием request и попадёт в отчёт."""
+    svc = match_service(route.request.url)
+    if svc and svc.category in ("analytics", "ads"):
+        await route.abort()
+        return
+    await _guard_route(route)
+
+
 class Shots:
     """Бюджет скриншотов на одно сканирование (доказательства для полного отчёта)."""
 
@@ -177,6 +191,8 @@ class Shots:
 
 async def _visit(context: BrowserContext, url: str, shots: Shots, *, keep_html: bool = False) -> PageData:
     page = await context.new_page()
+    if not keep_html:
+        await page.route("**/*", _inner_route)
     requests: list[str] = []
     responses: list = []
     page.on("request", lambda r: requests.append(r.url))
@@ -189,11 +205,13 @@ async def _visit(context: BrowserContext, url: str, shots: Shots, *, keep_html: 
             if not responses:
                 raise
             resp = responses[-1]
+        # Главная — полное ожидание: фиксируем трекеры и cookies до согласия и отложенные баннеры.
+        # Внутренние страницы — короткое: нам нужны тексты, ссылки и формы, а не аналитика.
         try:
-            await page.wait_for_load_state("networkidle", timeout=4000)
+            await page.wait_for_load_state("networkidle", timeout=4000 if keep_html else 1500)
         except Exception:  # noqa: BLE001 — сайты с вечными long-poll запросами
             pass
-        await page.wait_for_timeout(1000)  # даём отработать отложенным скриптам и баннерам
+        await page.wait_for_timeout(1000 if keep_html else 300)
         data = await page.evaluate(EXTRACT_JS)
         if keep_html and len(data["text"]) < 300:
             # SPA и сайты с JS-проверкой браузера дорисовывают контент позже
@@ -226,6 +244,7 @@ async def _visit(context: BrowserContext, url: str, shots: Shots, *, keep_html: 
             buttons=data["buttons"],
             request_urls=list(dict.fromkeys(requests)),
             generator=data["generator"][:200],
+            consent_popup=data["consentPopup"],
             scripts=data["scripts"],
             headers=headers,
         )
@@ -260,6 +279,7 @@ async def crawl(start_url: str, progress: ProgressCb | None = None, shots_dir: P
 
     site = SiteData(start_url=start_url, host=host, server_ip=ip)
     shots = Shots(shots_dir)
+    t0 = time.monotonic()
     await asyncio.gather(_check_https(host, site.https), _set_geo(site))
 
     async with async_playwright() as pw:
@@ -272,13 +292,21 @@ async def crawl(start_url: str, progress: ProgressCb | None = None, shots_dir: P
             await context.route("**/*", _guard_route)
 
             # 1. Главная в "чистом" контексте — фиксируем cookies и запросы до согласия пользователя
+            t_home = time.monotonic()
             home = await _visit(context, start_url, shots, keep_html=True)
             if _looks_blocked(home):
-                log.warning("blocked: url=%s status=%s title=%r text_len=%s links=%s text=%r",
-                            home.url, home.status, home.title[:100], len(home.text), len(home.links), home.text[:300])
+                # JS-проверки (DDoS-Guard, Qrator, антибот Битрикса) ставят cookie и пускают со второго захода
+                log.info("home looks blocked, retrying: %s", _diag(home))
+                await asyncio.sleep(6)
+                home = await _visit(context, start_url, shots, keep_html=True)
+            site.timing["home_s"] = round(time.monotonic() - t_home, 1)
+            if _looks_blocked(home):
+                diag = _diag(home)
+                log.warning("blocked: %s", diag)
                 raise BlockedError(
                     "Сайт не отдал содержимое для проверки: сработала защита от ботов или доступ ограничен. "
-                    "Чтобы не выдавать недостоверное заключение, проверка остановлена."
+                    "Чтобы не выдавать недостоверное заключение, проверка остановлена.",
+                    diag={**diag, "screenshot": home.screenshot},
                 )
             site.pages.append(home)
             site.initial_request_urls = list(home.request_urls)
@@ -293,7 +321,47 @@ async def crawl(start_url: str, progress: ProgressCb | None = None, shots_dir: P
             if progress:
                 await progress(1, home.url)
 
-            # 2. Обход внутренних страниц с приоритетом юридически значимых
+            # 2. Режим: если HTML без браузера содержит почти тот же текст и ссылки — внутренние страницы
+            #    грузим HTTP-запросом (в разы быстрее), иначе сайт собирается JavaScript-ом и нужен браузер
+            http = httpx.AsyncClient(timeout=10, verify=False, follow_redirects=False,
+                                     headers={"User-Agent": settings.user_agent, "Accept-Language": "ru-RU,ru;q=0.9"})
+            mode = "browser"
+            try:
+                if not settings.fast_fetch:
+                    raise ValueError("fast fetch disabled")
+                raw_home = await http_page(http, home.url)
+                if raw_home and len(raw_home.text) >= 0.6 * len(home.text) and len(raw_home.links) >= 0.6 * len(home.links):
+                    mode = "hybrid"
+            except (httpx.HTTPError, PageGone, ValueError):
+                pass
+            site.stats = {"mode": mode, "browser": 1, "http": 0}
+            browser_slots = asyncio.Semaphore(settings.parallel_tabs)
+            rendered_forms = {form_signature(f) for f in home.forms if form_is_pd(f)}
+
+            def needs_browser(p: PageData) -> bool:
+                if len(p.text) < 200 or _looks_blocked(p):
+                    return True
+                # новая форма сбора ПДн — снимаем в браузере для скриншота-доказательства
+                return shots.left > 0 and any(form_is_pd(f) and form_signature(f) not in rendered_forms for f in p.forms)
+
+            async def fetch(url: str) -> PageData:
+                if mode == "hybrid":
+                    try:
+                        p = await http_page(http, url)
+                    except PageGone as e:
+                        raise RuntimeError(str(e)) from e
+                    except (httpx.HTTPError, ValueError):
+                        p = None
+                    if p and not needs_browser(p):
+                        site.stats["http"] += 1
+                        return p
+                async with browser_slots:
+                    p = await _visit(context, url, shots)
+                site.stats["browser"] += 1
+                rendered_forms.update(form_signature(f) for f in p.forms if form_is_pd(f))
+                return p
+
+            # 3. Обход внутренних страниц с приоритетом юридически значимых
             seen = {home.url.rstrip("/"), start_url.rstrip("/")}
             queue: list[tuple[int, int, int, str]] = []
             counter = 0
@@ -323,10 +391,11 @@ async def crawl(start_url: str, progress: ProgressCb | None = None, shots_dir: P
             enqueue(home, 1)
             in_flight: dict[asyncio.Task, int] = {}
             while (queue or in_flight) and len(site.pages) < settings.max_pages:
-                while queue and len(in_flight) < PARALLEL_TABS and len(site.pages) + len(in_flight) < settings.max_pages:
+                limit = settings.parallel_tabs + (HTTP_PARALLEL if mode == "hybrid" else 0)
+                while queue and len(in_flight) < limit and len(site.pages) + len(in_flight) < settings.max_pages:
                     _, depth, _, url = heapq.heappop(queue)
                     if depth <= settings.max_depth:
-                        in_flight[asyncio.create_task(_visit(context, url, shots))] = depth
+                        in_flight[asyncio.create_task(fetch(url))] = depth
                 if not in_flight:
                     break
                 done, _ = await asyncio.wait(in_flight, return_when=asyncio.FIRST_COMPLETED)
@@ -345,14 +414,31 @@ async def crawl(start_url: str, progress: ProgressCb | None = None, shots_dir: P
                     enqueue(pd, depth + 1)
             for task in in_flight:
                 task.cancel()
+            site.truncated = len(site.pages) >= settings.max_pages and bool(queue or in_flight)
+            await http.aclose()
+            inner = time.monotonic() - t_home - site.timing["home_s"]
+            site.timing.update(
+                inner_s=round(inner, 1),
+                avg_page_s=round(inner / max(len(site.pages) - 1, 1), 2),
+                pages=len(site.pages),
+                errors=len(site.errors),
+            )
             await context.close()
         finally:
             await browser.close()
+    site.timing["total_s"] = round(time.monotonic() - t0, 1)
     return site
 
 
 class BlockedError(RuntimeError):
-    pass
+    def __init__(self, msg: str, diag: dict | None = None):
+        super().__init__(msg)
+        self.diag = diag or {}
+
+
+def _diag(p: PageData) -> dict:
+    return {"url": p.url, "status": p.status, "title": p.title[:150], "text_len": len(p.text),
+            "links": len(p.links), "text": p.text[:400]}
 
 
 BLOCK_RE = re.compile(

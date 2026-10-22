@@ -80,9 +80,11 @@ def test_foreign_trackers_and_cookies():
     site.initial_cookies = [{"name": "_ga", "domain": ".example.ru"}]
     site.pages[0].text = site.pages[0].text.replace("cookie", "")
     f = by_id(build_report(site))
-    assert f["foreign_services"]["status"] == "fail"
+    assert f["foreign_services"]["status"] == "warn"  # GTM без других счётчиков — риск, а не нарушение
     assert "Google Tag Manager" in f["foreign_services"]["summary"]
     assert f["cookies"]["status"] == "fail"
+    site.pages[0].request_urls.append("https://www.google-analytics.com/g/collect")
+    assert by_id(build_report(site))["foreign_services"]["status"] == "fail"
 
 
 def test_foreign_auth_and_meta():
@@ -197,3 +199,52 @@ def test_blocked_page_detection():
 def test_pd_input_detection(name, expected):
     from app.scanner.checks.common import input_is_pd
     assert input_is_pd(FormInput("text", name)) is expected
+
+
+@pytest.mark.parametrize("text,expected", [
+    ("Меню\n12+\nКонтакты", "12+"),
+    ("© 2026 ООО Ромашка. 0+", "0+"),
+    ("16+ © Ромашка", "16+"),
+    ("Как добавить предупреждение о возрастном ограничении (например, 18+)?", None),
+    ("Скидка 10+ процентов", None),
+])
+def test_age_mark_must_stand_alone(text, expected):
+    from app.scanner.checks.content import check_age_rating
+    site = good_site()
+    for p in site.pages:
+        p.text = text
+    f = check_age_rating(site)
+    assert (f.status == "pass") == (expected is not None)
+    if expected:
+        assert f.evidence == [expected]
+
+
+def test_service_forms_do_not_need_consent():
+    site = good_site()
+    site.pages[0].forms = [
+        Form(action="/auth", method="post", inputs=[FormInput("text", "USER_EMAIL", "E-mail")], checkboxes=[],
+             text="Забыли пароль? Введите e-mail", links=[], submit="Выслать"),
+        Form(action="/sub", method="post", inputs=[FormInput("text", "sf_EMAIL", "")], checkboxes=[],
+             text="Изменить подписку. Если Вы уже подписаны на рассылку, введите e-mail", links=[],
+             submit="Выслать код подтверждения"),
+    ]
+    f = by_id(build_report(site))
+    assert f["forms_consent"]["status"] == "info"  # форм сбора ПДн новых людей нет
+    assert "newsletter_consent" not in f
+
+
+def test_bitrix_consent_popup_counts_as_separate_document():
+    site = good_site()
+    for p in site.pages:
+        p.links = [l for l in p.links if "soglas" not in l.href]
+    site.pages[0].forms[0].links = []
+    assert by_id(build_report(site))["separate_consent"]["status"] == "fail"
+    site.pages[0].consent_popup = True
+    assert by_id(build_report(site))["separate_consent"]["status"] == "pass"
+
+
+def test_travel_not_detected_from_word_hotel_in_verbs():
+    from app.scanner.profile import build_profile
+    site = good_site()
+    site.pages[0].text = "Мы хотели бы рассказать. Вы хотели узнать номер телефона? Тур-нир. " * 5
+    assert not any(t["code"] == "travel" for t in build_profile(site)["types"])

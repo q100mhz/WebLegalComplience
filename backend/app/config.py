@@ -10,10 +10,12 @@ class Settings(BaseSettings):
     redis_url: str = "redis://localhost:6379/0"
 
     # Лимиты открытой версии
-    max_pages: int = 30
-    max_depth: int = 3
+    max_pages: int = 50
+    max_depth: int = 4
     page_timeout_ms: int = 15000
-    scan_timeout_s: int = 300
+    scan_timeout_s: int = 420
+    parallel_tabs: int = 3  # вкладок браузера на одну проверку; ~1 на ядро CPU
+    fast_fetch: bool = True  # внутренние страницы без JavaScript грузить HTTP-запросом
     rate_limit_per_hour: int = 10
     dedup_minutes: int = 15
     worker_concurrency: int = 2

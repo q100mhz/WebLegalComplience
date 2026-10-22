@@ -55,6 +55,8 @@ class PageData:
     headers: dict[str, str] = field(default_factory=dict)
     html: str = ""  # сохраняется только для главной — нужен для определения CMS
     screenshot: str | None = None
+    via: str = "browser"  # browser | http — чем загружена страница
+    consent_popup: bool = False  # согласие во всплывающем окне (компонент main.userconsent Битрикса)
 
 
 @dataclass
@@ -80,6 +82,10 @@ class SiteData:
     server_country: str | None = None
     errors: list[str] = field(default_factory=list)
     profile: dict = field(default_factory=dict)
+    timing: dict = field(default_factory=dict)
+    # mode: hybrid | browser; сколько страниц загружено каждым способом
+    stats: dict = field(default_factory=dict)
+    truncated: bool = False  # достигнут лимит страниц, а ссылки ещё оставались
 
     @property
     def home(self) -> PageData | None:

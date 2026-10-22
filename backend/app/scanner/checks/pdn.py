@@ -14,6 +14,7 @@ from .common import (
     policy_links,
     policy_pages,
     short,
+    field_label,
     unique_pd_forms,
 )
 
@@ -115,7 +116,7 @@ def check_forms_consent(site: SiteData) -> Finding:
     bad: dict[str, list[str]] = defaultdict(list)
     for page, f in forms:
         consent_boxes = [c for c in f.checkboxes if re.search(r"согла|персональн|политик|обработк|конфиденц", c.label, re.I)]
-        fields = ", ".join(i.placeholder or i.name or i.type for i in f.inputs[:4])
+        fields = ", ".join(field_label(i) for i in f.inputs[:4])
         where = f"{short(page.url, 90)} — поля: {fields}"
         if any(c.checked for c in consent_boxes):
             bad["prechecked"].append(where)
@@ -160,6 +161,14 @@ def check_separate_consent(site: SiteData) -> Finding | None:
         id="separate_consent", category=CAT, title="Согласие оформлено отдельным документом",
         law="152-ФЗ, ч. 1 ст. 9 (ред. 156-ФЗ, с 01.09.2025)",
     )
+    if not consent_links and any(p.consent_popup for p in site.pages):
+        return Finding(
+            **base, status="pass", severity="low",
+            summary="Текст согласия показывается во всплывающем окне при отправке формы "
+            "(компонент «Согласие пользователя» 1С-Битрикс) — это отдельный документ.",
+            recommendation="Убедитесь, что галочка согласия не стоит по умолчанию: в компоненте Битрикса она включена "
+            "в настройках «Отмечено по умолчанию».",
+        )
     if not consent_links:
         return Finding(
             **base, status="fail", severity="medium",
@@ -233,6 +242,15 @@ def check_foreign_services(site: SiteData) -> Finding:
         return Finding(**base, status="pass", severity="low", summary="Иностранные сервисы, собирающие данные, не обнаружены.")
     evidence = [f"{n} ({CAT_RU.get(c, c)})" for n, c in sorted(found.items(), key=lambda x: (x[1] not in HIGH_RISK, x[0]))]
     high = [n for n, c in found.items() if c in HIGH_RISK]
+    if high == ["Google Tag Manager"]:
+        # GTM — контейнер: сам по себе он лишь загружает другие теги. Доказанного сбора данных нет — это риск.
+        return Finding(
+            **base, status="warn", severity="medium", evidence=evidence,
+            summary="Подключён Google Tag Manager — иностранный сервис, который передаёт Google IP-адрес посетителя "
+            "и может подгружать другие иностранные счётчики.",
+            recommendation="Проверьте, какие теги подключены в контейнере GTM. Лучше отказаться от GTM в пользу "
+            "прямой установки российских счётчиков (Яндекс Метрика, VK Пиксель).",
+        )
     if high:
         return Finding(
             **base, status="fail", severity="high", evidence=evidence,

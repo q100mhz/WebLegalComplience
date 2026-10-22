@@ -69,13 +69,39 @@ def form_signature(f: Form) -> str:
     return "|".join(sorted(f"{i.type}:{i.name}" for i in f.inputs)) + "#" + str(len(f.checkboxes))
 
 
+# Служебные формы для тех, кто уже дал согласие: вход, восстановление пароля, управление подпиской
+SERVICE_FORM_RE = re.compile(
+    r"забыли\s+пароль|восстанов\w*\s+(парол|доступ)|выслать\s+(новый\s+)?пароль|отписаться|изменить\s+подписку|"
+    r"уже\s+подписаны|управлени\w*\s+подписк|forgot|reset\s+password|unsubscribe",
+    re.I,
+)
+
+
+SERVICE_URL_RE = re.compile(r"forgot|change_?password|restore|recover|reset|unsubscribe", re.I)
+# Кнопка «Подписаться», «Отправить заявку» и т.п. — значит, форма собирает данные новых людей
+NEW_DATA_SUBMIT_RE = re.compile(r"подписат|зарегистр|отправить|оставить|заказ|купить|записат|получить|subscribe|sign\s?up|send", re.I)
+
+
+def is_service_form(f: Form, page_url: str = "") -> bool:
+    if any(i.type == "password" for i in f.inputs) and not re.search(r"регистрац|зарегистр|sign\s?up", f.text + f.submit, re.I):
+        return True
+    if NEW_DATA_SUBMIT_RE.search(f.submit):
+        return False
+    return bool(SERVICE_FORM_RE.search(f"{f.submit} {f.text[:800]}") or SERVICE_URL_RE.search(page_url))
+
+
+def field_label(i) -> str:
+    return (i.placeholder or "").strip() or (i.name or "").strip() or i.type
+
+
 def unique_pd_forms(site: SiteData) -> list[tuple[PageData, Form]]:
-    """Формы с ПДн без дублей (форма в шапке/футере повторяется на каждой странице)."""
+    """Формы, которые собирают ПДн новых людей, без дублей (форма в футере повторяется на каждой странице).
+    Служебные формы (вход, восстановление пароля, управление подпиской) не считаются."""
     seen: set[str] = set()
     res = []
     for p in site.pages:
         for f in p.forms:
-            if not form_is_pd(f):
+            if not form_is_pd(f) or is_service_form(f, p.url):
                 continue
             sig = form_signature(f)
             if sig in seen:
@@ -95,3 +121,14 @@ def short(url: str, n: int = 120) -> str:
 
 def abs_link(page: PageData, link: Link) -> str:
     return clean_link(page.url, link.href) or link.href
+
+
+def has_type(site: SiteData, code: str, strong: bool = False) -> bool:
+    """Определён ли тип бизнеса в профиле сайта (профиль строит scanner/profile.py).
+    strong — тип основной или почти равен основному по весу: для отраслевых требований
+    (лицензии и т.п.) мало того, что тема просто упоминается на сайте."""
+    types = site.profile.get("types", [])
+    t = next((t for t in types if t["code"] == code), None)
+    if not t:
+        return False
+    return not strong or t["score"] >= 0.7 * types[0]["score"]

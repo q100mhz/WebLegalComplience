@@ -12,7 +12,7 @@ from . import rkn
 from .config import settings, shots_dir
 from .db import Scan, SessionLocal, kv_get, utcnow
 from .scanner.checks.pdn import find_inns
-from .scanner.crawler import crawl
+from .scanner.crawler import BlockedError, crawl
 from .scanner.report import build_report
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
@@ -57,7 +57,9 @@ async def run_scan(ctx, scan_id: str) -> None:
             msg = "Сайт недоступен"
         if msg.startswith("http") and ": Page.goto" in msg:
             msg = "Главная страница сайта не загрузилась за отведённое время"
-        await _update(scan_id, status="failed", error=msg, finished_at=utcnow())
+        # Подробности для админки (в публичный отчёт не попадают)
+        diag = e.diag if isinstance(e, BlockedError) else {"exception": f"{type(e).__name__}: {str(e)[:1000]}"}
+        await _update(scan_id, status="failed", error=msg, finished_at=utcnow(), result={"diagnostics": diag})
 
 
 async def cleanup_shots(ctx) -> None:

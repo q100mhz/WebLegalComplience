@@ -206,3 +206,4 @@ a { color: var(--brand); }
   .admin-nav { flex-direction: row; flex-wrap: wrap; position: static; }
   .two-col { grid-template-columns: 1fr; }
 }
+.diag-val { max-width: 70%; text-align: right; word-break: break-word; font-size: 13px; }

@@ -3,8 +3,7 @@
 import re
 
 from ..models import Finding, SiteData
-from ..profile import has_type
-from .common import INN_RE, OGRN_RE, all_text, form_is_pd, link_is_policy, short, unique_pd_forms
+from .common import INN_RE, OGRN_RE, all_text, form_is_pd, has_type, link_is_policy, short, unique_pd_forms
 
 
 def _links_text(site: SiteData) -> str:
@@ -32,7 +31,7 @@ def check_policy_on_form_pages(site: SiteData) -> Finding | None:
 
 
 def check_newsletter_consent(site: SiteData) -> Finding | None:
-    forms = [f for f in site.profile.get("forms", []) if f["kind"] == "newsletter"]
+    forms = [f for f in site.profile.get("forms", []) if f["kind"] == "newsletter" and not f.get("service")]
     combined = [
         (p.url, c.label) for p in site.pages for f in p.forms for c in f.checkboxes
         if re.search(r"персональн", c.label, re.I) and re.search(r"реклам|рассылк|маркетинг", c.label, re.I)
@@ -163,7 +162,7 @@ def check_restricted_goods(site: SiteData) -> Finding | None:
 
 
 def check_education(site: SiteData) -> Finding | None:
-    if not has_type(site, "education"):
+    if not has_type(site, "education", strong=True):
         return None
     hay = all_text(site) + " " + _links_text(site)
     base = dict(id="education_info", category="Отраслевые требования", title="Образовательная деятельность",
@@ -188,7 +187,7 @@ def check_education(site: SiteData) -> Finding | None:
 
 
 def check_medical(site: SiteData) -> list[Finding]:
-    if not has_type(site, "medical"):
+    if not has_type(site, "medical", strong=True):
         return []
     text = all_text(site)
     res = []
@@ -228,7 +227,7 @@ def check_supplements(site: SiteData) -> Finding | None:
 
 
 def check_finance(site: SiteData) -> Finding | None:
-    if not has_type(site, "finance"):
+    if not has_type(site, "finance", strong=True):
         return None
     text = all_text(site)
     missing = []

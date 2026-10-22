@@ -159,11 +159,15 @@ def check_ecommerce(site: SiteData) -> Finding | None:
     )
 
 
-AGE_RE = re.compile(r"(?<![\d.,:+])(0|6|12|16|18)\s?\+(?!\d)")
+AGE_MARK = r"(?<![\d.,:+])(?:0|6|12|16|18)\s?\+(?!\d)"
+# Знак засчитывается, только если стоит отдельным элементом или рядом с ©, а не внутри фразы
+# («Как добавить предупреждение 18+?» — это не маркировка сайта)
+AGE_RE = re.compile(rf"(?:^|\n)[ \t]*({AGE_MARK})[ \t]*(?:\n|$)|©[^\n]{{0,200}}?({AGE_MARK})|({AGE_MARK})[^\n]{{0,40}}©")
 
 
 def check_age_rating(site: SiteData) -> Finding:
-    found = next((m.group(0) for p in site.pages for m in [AGE_RE.search(p.text)] if m), None)
+    found = next((next(g for g in m.groups() if g).replace(" ", "")
+                  for p in site.pages for m in [AGE_RE.search(p.text)] if m), None)
     base = dict(
         id="age_rating", category="Информация и технологии", title="Возрастная маркировка",
         law="436-ФЗ «О защите детей от информации…», ст. 6, 12",

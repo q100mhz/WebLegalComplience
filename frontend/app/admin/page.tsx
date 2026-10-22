@@ -102,6 +102,7 @@ export default function Dashboard() {
         Реестр РКН: {s.rkn.status || "не загружен"}
         {s.rkn.rows ? ` · ${s.rkn.rows.toLocaleString("ru-RU")} записей · данные на ${s.rkn.updated} · обновлён ${fmtDate(s.rkn.finished_at)}` : ""}
       </p>
+      {s.rkn.error && <p className="form-error">Ошибка импорта реестра РКН: {s.rkn.error} (<Link href="/admin/rkn">подробнее</Link>)</p>}
     </>
   );
 }

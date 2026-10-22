@@ -9,9 +9,20 @@ import type { Finding, Report } from "@/lib/types";
 interface Detail {
   id: string; url: string; host: string; status: string; score: number | null; client_ip: string | null;
   error: string | null; created_at: string; finished_at: string | null;
-  result: (Report & { errors?: string[] }) | null;
+  result: (Report & {
+    errors?: string[];
+    timing?: Record<string, number>;
+    stats?: { mode?: string; browser?: number; http?: number };
+    truncated?: boolean;
+    diagnostics?: Record<string, string | number | null>;
+  }) | null;
   feedback: { id: number; finding_id: string; kind: string; comment: string; contact: string; status: string; created_at: string }[];
 }
+
+const DIAG: Record<string, string> = {
+  url: "Адрес", status: "HTTP-код ответа", title: "Заголовок страницы", text_len: "Символов текста",
+  links: "Ссылок на странице", text: "Начало текста", exception: "Исключение",
+};
 
 export default function ScanDetail({ params }: { params: Promise<{ id: string }> }) {
   const { id } = use(params);
@@ -36,6 +47,38 @@ export default function ScanDetail({ params }: { params: Promise<{ id: string }>
       </p>
       {d.error && <p className="form-error">{d.error}</p>}
 
+      {r?.diagnostics && (
+        <div className="card">
+          <h3>Диагностика сбоя</h3>
+          {Object.entries(r.diagnostics).filter(([k]) => k !== "screenshot").map(([k, v]) => (
+            <div key={k} className="row"><span className="meta">{DIAG[k] || k}</span><span className="diag-val">{String(v ?? "—")}</span></div>
+          ))}
+          {r.diagnostics.screenshot && (
+            <>
+              <h3>Что увидел сканер</h3>
+              {/* eslint-disable-next-line @next/next/no-img-element */}
+              <img className="shot" src={shot(String(r.diagnostics.screenshot))!} alt="Скриншот при блокировке" />
+            </>
+          )}
+        </div>
+      )}
+
+      {r?.timing && (
+        <div className="card">
+          <h3>Скорость проверки</h3>
+          <div className="row"><span>Всего</span><b>{r.timing.total_s} с</b></div>
+          <div className="row"><span>Главная страница (браузер)</span><b>{r.timing.home_s} с</b></div>
+          <div className="row"><span>Остальные страницы</span><b>{r.timing.inner_s} с · в среднем {r.timing.avg_page_s} с/стр.</b></div>
+          {r.stats && (
+            <div className="row">
+              <span>Режим загрузки</span>
+              <b>{r.stats.mode === "hybrid" ? "гибридный" : "только браузер (сайт на JavaScript)"} · браузером {r.stats.browser}, HTTP {r.stats.http}</b>
+            </div>
+          )}
+          {r.truncated && <p className="meta">Достигнут лимит страниц — на сайте есть и другие страницы.</p>}
+        </div>
+      )}
+
       {d.feedback.length > 0 && (
         <div className="card">
           <h3>Обратная связь по проверке</h3>
@@ -45,7 +88,7 @@ export default function ScanDetail({ params }: { params: Promise<{ id: string }>
         </div>
       )}
 
-      {r && (
+      {r?.findings && (
         <>
           {r.pages[0]?.screenshot && (
             <div className="card">
