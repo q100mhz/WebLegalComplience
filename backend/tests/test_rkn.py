@@ -22,3 +22,16 @@ def test_parse_registry_xml():
     assert rows[0]["name"] == "ПАО Сбербанк"
     assert rows[0]["reg_date"] == "2014-03-01"
     assert rows[1]["reg_number"] == "1"
+
+
+def test_catalog_finds_operators_dataset():
+    from app.rkn import _as_base, _catalog_candidates
+    csv_text = (
+        "property;title;url\n"
+        "7705846236-NewsRSS;Новости;https://rkn.gov.ru/opendata/7705846236-NewsRSS/\n"
+        "7705846236-OperatorsPD;Реестр операторов, осуществляющих обработку персональных данных;"
+        "https://rkn.gov.ru/opendata/7705846236-OperatorsPD/meta.csv\n"
+    )
+    urls = _catalog_candidates(csv_text)
+    assert urls == ["https://rkn.gov.ru/opendata/7705846236-OperatorsPD/meta.csv"]
+    assert _as_base(urls[0]) == "https://rkn.gov.ru/opendata/7705846236-OperatorsPD/"

@@ -43,24 +43,56 @@ def _local(tag: str) -> str:
 
 
 DATASET_RE = re.compile(r'href="([^"]*7705846236-[^"/]*Operator[^"/]*/?)"', re.I)
+CATALOG_URL = "https://rkn.gov.ru/opendata/list.csv"
+OPERATORS_ROW_RE = re.compile(r"OperatorsPD|операторов[^;,]{0,60}персональн|персональн[^;,]{0,40}операторов", re.I)
+URL_RE = re.compile(r"(?:https?://[^\s;,\"']+|/opendata/[^\s;,\"']+)")
+DATA_FILE_RE = re.compile(r"data-\d{8}.*\.(zip|xml)$", re.I)
 
 
-async def _dataset_pages(client: httpx.AsyncClient) -> list[str]:
-    """Адрес набора из настроек, а если он устарел — найденные в каталоге rkn.gov.ru/opendata/."""
+def _catalog_candidates(text: str) -> list[str]:
+    """Ссылки из строк каталога list.csv, относящихся к реестру операторов ПДн."""
+    found = []
+    for row in csv.reader(io.StringIO(text), delimiter=";" if text.count(";") > text.count(",") else ","):
+        line = " ".join(row)
+        if OPERATORS_ROW_RE.search(line):
+            found += [str(httpx.URL("https://rkn.gov.ru/").join(u.strip())) for u in URL_RE.findall(line)]
+    return list(dict.fromkeys(found))
+
+
+def _as_base(url: str) -> str:
+    """Адрес страницы набора: из ссылки на meta.csv или саму страницу."""
+    if url.lower().endswith((".csv", ".xml", ".json")) and "/meta" in url.lower():
+        return url.rsplit("/", 1)[0] + "/"
+    return url.rstrip("/") + "/"
+
+
+async def _dataset_pages(client: httpx.AsyncClient) -> tuple[list[str], list[str]]:
+    """(страницы набора, прямые ссылки на файлы). Источники: настройка RKN_OPENDATA_URL,
+    каталог rkn.gov.ru/opendata/list.csv (текущий формат РКН) и HTML-страница каталога (старый формат)."""
     pages = [settings.rkn_opendata_url.rstrip("/") + "/"]
+    files: list[str] = []
+    try:
+        r = await client.get(CATALOG_URL)
+        if r.status_code == 200:
+            for u in _catalog_candidates(r.content.decode("utf-8-sig", errors="replace")):
+                (files if DATA_FILE_RE.search(u) else pages).append(u if DATA_FILE_RE.search(u) else _as_base(u))
+    except httpx.HTTPError:
+        log.info("RKN catalog list.csv not available")
     try:
         r = await client.get("https://rkn.gov.ru/opendata/")
-        found = [str(httpx.URL("https://rkn.gov.ru/opendata/").join(h)).rstrip("/") + "/"
-                 for h in DATASET_RE.findall(r.text)]
-        pages += [u for u in dict.fromkeys(found) if u not in pages]
+        pages += [str(httpx.URL("https://rkn.gov.ru/opendata/").join(h)).rstrip("/") + "/"
+                  for h in DATASET_RE.findall(r.text)]
     except httpx.HTTPError:
-        log.info("RKN opendata catalog not available")
-    return pages
+        log.info("RKN opendata page not available")
+    return list(dict.fromkeys(pages)), list(dict.fromkeys(files))
 
 
 async def _find_data_url(client: httpx.AsyncClient) -> str:
     tried = []
-    for base in await _dataset_pages(client):
+    pages, files = await _dataset_pages(client)
+    if files:
+        return sorted(files)[-1]  # имя файла содержит дату — берём самый свежий
+    for base in pages:
         tried.append(base)
         try:
             r = await client.get(base + "meta.csv")
