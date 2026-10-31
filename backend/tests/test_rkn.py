@@ -44,3 +44,53 @@ def test_captcha_is_unavailable():
 
 def test_inn_checksum():
     assert _inn_ok("7707083893") and not _inn_ok("7707083890")
+
+
+CARD = """<html><body><table class="TblList">
+<tr><td>Регистрационный номер</td><td>11-0187199</td></tr>
+<tr><td>Наименование оператора</td><td>ООО «Ромашка»</td></tr>
+<tr><td>Цель обработки персональных данных</td><td>обработка заявок; заключение договоров</td></tr>
+<tr><td>Категории персональных данных</td><td>фамилия, имя, отчество; адрес электронной почты</td></tr>
+<tr><td>Осуществление трансграничной передачи</td><td>нет</td></tr>
+<tr><td>Сведения о местонахождении базы данных</td><td>Россия, г. Москва</td></tr>
+</table></body></html>"""
+
+
+def test_parse_card_and_summary():
+    from app.rkn import card_summary, parse_card
+    s = card_summary(parse_card(CARD))
+    assert s["transborder"] is False and s["db_russia"] is True
+    assert "адрес электронной почты" in s["categories_text"]
+
+
+def test_unparseable_card_is_unavailable_not_a_violation():
+    from app.rkn import parse_card
+    with pytest.raises(PortalUnavailable):
+        parse_card("<html><body><p>Сервис временно недоступен</p></body></html>")
+
+
+def _site_with_card(card, services):
+    from tests.test_checks import good_site
+    site = good_site()
+    site.profile = {"rkn": {"checked": True, "matches": {"7707083893": [
+        {"reg_number": "11-0187199", "url": "https://pd.rkn.gov.ru/x", "card": card}]}}}
+    site.initial_request_urls = services
+    return site
+
+
+def test_card_cross_check():
+    from app.rkn import card_summary, parse_card
+    from app.scanner.report import build_report
+    by_id = lambda r: {f["id"]: f for f in r["findings"]}  # noqa: E731
+    card = card_summary(parse_card(CARD))
+    # Google Analytics на сайте, а в уведомлении «трансграничной передачи нет» → нарушение
+    f = by_id(build_report(_site_with_card(card, ["https://www.google-analytics.com/g/collect"])))["rkn_notification"]
+    assert f["status"] == "fail" and "Google Analytics" in f["summary"]
+    # форма собирает телефон, а в уведомлении его нет → риск
+    f = by_id(build_report(_site_with_card(card, [])))["rkn_notification"]
+    assert f["status"] == "warn" and "номер телефона" in f["summary"]
+    # всё совпадает
+    full = {**card, "categories_text": card["categories_text"] + "; номер телефона; имя"}
+    assert by_id(build_report(_site_with_card(full, [])))["rkn_notification"]["status"] == "pass"
+    # карточку не загрузили → только «не удалось сверить»
+    assert by_id(build_report(_site_with_card(None, [])))["rkn_notification"]["status"] == "info"

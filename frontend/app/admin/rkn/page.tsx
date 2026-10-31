@@ -3,7 +3,11 @@
 import { useEffect, useState } from "react";
 import { adminFetch, fmtDate } from "@/lib/admin";
 
-interface RknRecord { reg_number: string; name: string; basis: string; reg_date: string; start_date: string; url: string }
+interface RknCard { transborder: boolean | null; transborder_text: string; db_location: string; categories_text: string }
+interface RknRecord {
+  reg_number: string; name: string; basis: string; reg_date: string; start_date: string; url: string;
+  card?: RknCard; card_error?: string;
+}
 interface Check { inn: string; found?: boolean; records?: RknRecord[]; checked_at?: string; cached?: boolean; error?: string }
 interface Status {
   status?: string; last_ok?: string; last_error?: string; error?: string; requests?: number; errors?: number;
@@ -84,6 +88,14 @@ function CheckView({ c, compact }: { c: Check; compact?: boolean }) {
                 Рег. № <a href={r.url} target="_blank" rel="noreferrer">{r.reg_number}</a> · уведомление от {r.reg_date} ·
                 обработка с {r.start_date} · {r.basis}
               </span>
+              {r.card && (
+                <span className="meta" style={{ display: "block", marginTop: 6 }}>
+                  Трансграничная передача: <b>{r.card.transborder == null ? "не указано" : r.card.transborder ? "да" : "нет"}</b>
+                  {" · "}Базы данных: <b>{r.card.db_location || "не указано"}</b>
+                  <br />Категории данных: {r.card.categories_text ? r.card.categories_text.slice(0, 400) : "не указано"}
+                </span>
+              )}
+              {r.card_error && <span className="txt-bad" style={{ display: "block" }}>Карточка: {r.card_error}</span>}
             </p>
           )}
         </div>

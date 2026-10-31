@@ -54,7 +54,8 @@ def build_report(site: SiteData) -> dict:
     # официальное наименование из реестра РКН надёжнее найденного на сайте
     for recs in ((site.profile.get("rkn") or {}).get("matches") or {}).values():
         if recs:
-            site.profile["owner"] = {**site.profile.get("owner", {}), "name_official": recs[0].get("name", "")}
+            site.profile["owner"] = {**site.profile.get("owner", {}), "name_official": recs[0].get("name", ""),
+                                     "rkn_reg_number": recs[0].get("reg_number", "")}
             break
     findings = run_checks(site)
     value = score(findings)

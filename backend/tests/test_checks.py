@@ -293,3 +293,18 @@ def test_owner_extraction():
     assert o["phone"].startswith("+7 (495)")
     site.pages[0].text = "ИП Иванов Иван Иванович, ИНН 500100732259"
     assert extract_owner(site)["name"] == "ИП Иванов Иван Иванович"
+
+
+def test_no_check_raises():
+    """Отчёт глотает исключения отдельных проверок (чтобы одна не роняла всё) — поэтому ловим их здесь."""
+    from app.rkn import card_summary, parse_card
+    from app.scanner.checks import CHECKS
+    from app.scanner.profile import build_profile
+    from tests.test_rkn import CARD
+    site = good_site()
+    site.initial_request_urls = ["https://www.google-analytics.com/g/collect", "https://mc.yandex.ru/metrika/tag.js"]
+    site.profile = {"rkn": {"checked": True, "matches": {"7707083893": [
+        {"reg_number": "1", "url": "u", "card": card_summary(parse_card(CARD))}]}}}
+    site.profile = {**build_profile(site), **site.profile}
+    for check in CHECKS:
+        check(site)  # исключение здесь = ошибка в правиле

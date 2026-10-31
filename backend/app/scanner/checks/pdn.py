@@ -318,3 +318,82 @@ def check_rkn_registry(site: SiteData) -> Finding:
         recommendation="Подайте уведомление об обработке ПДн на pd.rkn.gov.ru (или через Госуслуги). "
         "Если уведомление уже подано — укажите его номер в отчёте, мы учтём это при следующей проверке.",
     )
+
+
+# Категории данных из форм сайта → как они называются в уведомлении РКН
+CARD_CATEGORY_RE = {
+    "номер телефона": r"телефон",
+    "адрес электронной почты": r"почт|e-?mail",
+    "фамилия, имя, отчество": r"фамили|ф\.?\s?и\.?\s?о|фио",
+    "имя": r"\bим[яе]|фамили",
+    "адрес (для доставки)": r"адрес\w*\s+(места\s+)?(жительств|регистрац|доставк|проживан)|\bадрес\b(?!\w*\s+электронн)",
+    "дата рождения": r"рожден",
+    "паспортные данные": r"паспорт",
+    "СНИЛС": r"снилс|страхов\w+\s+номер",
+    "ИНН": r"\bинн\b|идентификационн\w+\s+номер\s+налогоплательщик",
+}
+METRICS_IN_CARD_RE = re.compile(r"cookie|куки|метрическ|ip-?\s?адрес|идентификатор\w*\s+(устройств|пользовател|браузер)|"
+                                r"сведения\s+о\s+(действиях|посещени)|пользовательск\w+\s+данн", re.I)
+
+
+def check_rkn_notification(site: SiteData) -> Finding | None:
+    """Сверка карточки оператора в реестре РКН с тем, что сервис увидел на сайте:
+    трансграничная передача, расположение баз данных, категории данных из форм, данные метрик."""
+    from ...documents.facts import categories_for
+    from .common import form_is_pd, is_service_form
+
+    rkn = site.profile.get("rkn") or {}
+    rec = next((recs[0] for recs in (rkn.get("matches") or {}).values() if recs), None)
+    if not rec:
+        return None  # оператора нет в реестре — об этом проверка rkn_registry
+    base = dict(id="rkn_notification", category=CAT, title="Сведения в уведомлении РКН и сайт",
+                law="152-ФЗ, ч. 3, 7 ст. 22")
+    card = rec.get("card")
+    link = rec.get("url") or ""
+    if not card:
+        return Finding(**base, status="info", severity="low", evidence=[link] if link else [],
+                       summary="Не удалось загрузить карточку оператора в реестре — сведения уведомления не сверены.",
+                       recommendation="Сверьте вручную: цели, категории данных, трансграничная передача и место баз данных "
+                       "в уведомлении должны соответствовать сайту.")
+    fails, warns = [], []
+
+    foreign = sorted({s["name"] for s in site.profile.get("services", [])
+                      if s.get("foreign") and s["category"] in ("analytics", "ads", "chat", "captcha")})
+    if foreign and card.get("transborder") is False:
+        fails.append(f"в уведомлении трансграничная передача не заявлена, а сайт передаёт данные иностранным "
+                     f"сервисам: {', '.join(foreign)}")
+    if card.get("db_russia") is False:
+        fails.append(f"базы данных в уведомлении указаны не в России: «{card.get('db_location', '')[:150]}»")
+
+    collected: list[str] = []
+    for p in site.pages:
+        for f in p.forms:
+            if form_is_pd(f) and not is_service_form(f, p.url):
+                for c in categories_for([i.placeholder or i.name for i in f.inputs]):
+                    if c not in collected:
+                        collected.append(c)
+    declared = card.get("categories_text") or ""
+    if declared:
+        missing = [c for c in collected if c in CARD_CATEGORY_RE and not re.search(CARD_CATEGORY_RE[c], declared, re.I)]
+        if missing:
+            warns.append("формы сайта собирают данные, которых нет в уведомлении: " + ", ".join(missing))
+        analytics = [s["name"] for s in site.profile.get("services", []) if s["category"] in ("analytics", "ads")]
+        if analytics and not METRICS_IN_CARD_RE.search(declared):
+            warns.append("на сайте работают метрические программы (" + ", ".join(analytics[:3]) + "), а в уведомлении "
+                         "не указаны собираемые ими данные (cookies, IP-адрес, сведения о действиях на сайте)")
+
+    evidence = ([f"Карточка оператора: {link}"] if link else []) + [
+        f"Трансграничная передача в уведомлении: {card.get('transborder_text') or 'не указано'}"[:200],
+        f"Базы данных: {card.get('db_location') or 'не указано'}"[:200],
+    ]
+    if not fails and not warns:
+        return Finding(**base, status="pass", severity="low", evidence=evidence,
+                       summary="Сведения в уведомлении РКН соответствуют тому, что найдено на сайте.")
+    return Finding(
+        **base, status="fail" if fails else "warn", severity="high" if fails else "medium",
+        evidence=evidence + [f"• {x}" for x in fails + warns],
+        summary="Сведения в уведомлении Роскомнадзора расходятся с тем, что происходит на сайте: "
+        + "; ".join(fails + warns) + ".",
+        recommendation="Подайте в РКН информационное письмо о внесении изменений в сведения об операторе (ч. 7 ст. 22 "
+        "152-ФЗ — в течение 10 рабочих дней с даты изменений) либо приведите сайт в соответствие с уведомлением.",
+    )

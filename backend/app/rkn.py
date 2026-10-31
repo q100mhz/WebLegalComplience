@@ -93,21 +93,92 @@ def _inn_ok(inn: str) -> bool:
     return False
 
 
-async def _fetch(client: httpx.AsyncClient, inn: str) -> list[dict]:
+async def _get(client: httpx.AsyncClient, params: dict) -> str:
+    """Запрос к порталу не чаще раза в REQUEST_INTERVAL: портал государственный, не создаём нагрузку."""
     global _last_request
-    async with _lock:  # не чаще раза в REQUEST_INTERVAL: портал государственный, не создаём нагрузку
+    async with _lock:
         wait = REQUEST_INTERVAL - (time.monotonic() - _last_request)
         if wait > 0:
             await asyncio.sleep(wait)
         try:
-            r = await client.get(PORTAL, params={"act": "search", "name_full": "", "inn": inn, "regn": ""})
+            r = await client.get(PORTAL, params=params)
         except httpx.HTTPError as e:
             raise PortalUnavailable(f"портал не ответил: {type(e).__name__}") from e
         finally:
             _last_request = time.monotonic()
     if r.status_code != 200:
         raise PortalUnavailable(f"портал ответил HTTP {r.status_code}")
-    return parse_search(r.text, inn)
+    return r.text
+
+
+async def _fetch(client: httpx.AsyncClient, inn: str) -> list[dict]:
+    return parse_search(await _get(client, {"act": "search", "name_full": "", "inn": inn, "regn": ""}), inn)
+
+
+# ---------- Карточка оператора ----------
+# Подписи полей карточки известны (Цель обработки, Категории персональных данных, Осуществление трансграничной
+# передачи, Сведения о местонахождении базы данных…), но вёрстка может меняться — разбираем пары «подпись → значение»
+# из любых таблиц и списков и ищем нужное по смыслу подписи.
+
+CARD_KEYS = re.compile(r"цел|категори|трансгранич|местонахожд|баз[аы]\s+данн|правов|перечень\s+действ", re.I)
+
+
+def parse_card(page: str) -> dict:
+    if BLOCK_RE.search(page):
+        raise PortalUnavailable("портал запросил капчу или ограничил доступ")
+    doc = lh.document_fromstring(page)
+    for el in doc.xpath("//script | //style"):
+        el.drop_tree()
+    norm = lambda t: re.sub(r"\s+", " ", t or "").strip()  # noqa: E731
+    fields: list[tuple[str, str]] = []
+    for tr in doc.xpath("//tr"):
+        cells = tr.xpath("./td | ./th")
+        if len(cells) >= 2:
+            label, value = norm(cells[0].text_content()), norm(" ".join(c.text_content() for c in cells[1:]))
+            if label and value and len(label) < 200:
+                fields.append((label.rstrip(":"), value))
+    for dt in doc.xpath("//dt"):
+        dd = dt.getnext()
+        if dd is not None and dd.tag == "dd":
+            fields.append((norm(dt.text_content()).rstrip(":"), norm(dd.text_content())))
+    text = norm(doc.text_content())
+    if not any(CARD_KEYS.search(lbl) for lbl, _ in fields):
+        # подписи и значения не в таблице — ищем «Подпись: значение» в тексте
+        for m in re.finditer(r"((?:Цель обработки|Категории [^:]{0,60}|Осуществление трансграничной передачи|"
+                             r"Сведения о местонахождении [^:]{0,40})[^:]{0,40}):\s*([^:]{1,600}?)(?=\s+[А-ЯЁ][а-яё ]{5,60}:|$)",
+                             text):
+            fields.append((norm(m.group(1)), norm(m.group(2))))
+    if not any(CARD_KEYS.search(lbl) for lbl, _ in fields):
+        raise PortalUnavailable("не удалось разобрать карточку оператора — изменилась разметка портала")
+    return {"fields": fields[:200], "text": text[:30000]}
+
+
+def card_summary(card: dict) -> dict:
+    """Что важно для сверки с сайтом: трансграничная передача, где базы данных, какие категории данных заявлены."""
+    fields = card.get("fields") or []
+    pick = lambda rx: [v for lbl, v in fields if re.search(rx, lbl, re.I)]  # noqa: E731
+    tb = " ".join(pick(r"трансгранич"))
+    transborder = None
+    if tb:
+        transborder = not re.search(r"\bнет\b|не\s+осуществля|отсутств", tb, re.I) and bool(
+            re.search(r"\bда\b|осуществля|государств|стран", tb, re.I))
+    db = " ".join(pick(r"местонахожд|баз[аы]\s+данн"))
+    categories = " ".join(pick(r"категори\w*\s+(персональн|обрабатыва)|перечень\s+персональн|персональн\w+\s+данн\w*,?\s+обрабатыв"))
+    purposes = " ".join(pick(r"^цел"))
+    return {
+        "transborder": transborder,
+        "transborder_text": tb[:300],
+        "db_location": db[:300],
+        # «Россия» в сведениях о базах данных; иная страна без России — локализация не соблюдена
+        "db_russia": bool(re.search(r"росси", db, re.I)) if db else None,
+        # категории иногда расписаны внутри каждой цели — тогда ищем по описанию целей
+        "categories_text": (categories or purposes)[:8000],
+        "purposes_text": purposes[:4000],
+    }
+
+
+async def _fetch_card(client: httpx.AsyncClient, reg_number: str) -> dict:
+    return card_summary(parse_card(await _get(client, {"id": reg_number})))
 
 
 async def _record_status(ok: bool, error: str = "") -> None:
@@ -134,6 +205,11 @@ async def check_inn(inn: str, client: httpx.AsyncClient | None = None, use_cache
     client = client or httpx.AsyncClient(timeout=20, headers=HEADERS, follow_redirects=True)
     try:
         records = await _fetch(client, inn)
+        if records:  # карточка — для сверки сведений уведомления с сайтом; её сбой не отменяет «найден в реестре»
+            try:
+                records[0]["card"] = await _fetch_card(client, records[0]["reg_number"])
+            except PortalUnavailable as e:
+                records[0]["card_error"] = str(e)
     except PortalUnavailable as e:
         log.warning("RKN portal unavailable for %s: %s", inn, e)
         await _record_status(False, str(e))

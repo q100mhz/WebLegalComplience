@@ -70,6 +70,7 @@ class Facts:
     address: str
     email: str
     phone: str
+    rkn_reg_number: str = ""
     purposes: list[dict] = field(default_factory=list)  # {kind, purpose, basis, term, categories}
     categories: list[str] = field(default_factory=list)
     services: list[dict] = field(default_factory=list)
@@ -140,6 +141,7 @@ def from_report(report: dict, url: str, checked_at: str) -> Facts:
         address=owner.get("address") or blank("адрес"),
         email=owner.get("email") or blank("e-mail для обращений по персональным данным"),
         phone=owner.get("phone") or "",
+        rkn_reg_number=owner.get("rkn_reg_number") or "",
         purposes=plist, categories=all_cats or [blank("перечень персональных данных")],
         services=services,
         foreign_services=[s["name"] for s in services if s.get("foreign") and s["category"] in

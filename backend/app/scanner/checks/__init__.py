@@ -17,6 +17,7 @@ CHECKS: list[Check] = [
     industry.check_foreign_platform,
     pdn.check_hosting,
     pdn.check_rkn_registry,
+    pdn.check_rkn_notification,
     industry.check_newsletter_consent,
     content.check_ad_marking,
     content.check_owner_info,
