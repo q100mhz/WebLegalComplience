@@ -170,11 +170,16 @@ def test_medical_site_profile_and_checks():
 
 def test_rkn_registry_lookup():
     site = good_site()
-    site.profile = {"rkn": {"loaded": True, "updated": "2026-10-01", "matches": {"7707083893": []}}}
+    site.profile = {"rkn": {"checked": True, "checked_at": "2026-10-31T10:00:00", "matches": {"7707083893": []}}}
     assert by_id(build_report(site))["rkn_registry"]["status"] == "fail"
     site = good_site()
-    site.profile = {"rkn": {"loaded": True, "matches": {"7707083893": [{"reg_number": "77-14-000123"}]}}}
-    assert by_id(build_report(site))["rkn_registry"]["status"] == "pass"
+    site.profile = {"rkn": {"checked": True, "matches": {"7707083893": [{"reg_number": "11-0187199", "reg_date": "24.03.2011",
+                                                                      "url": "https://pd.rkn.gov.ru/x"}]}}}
+    f = by_id(build_report(site))["rkn_registry"]
+    assert f["status"] == "pass" and "11-0187199" in f["evidence"][0]
+    site = good_site()
+    site.profile = {"rkn": {"checked": False, "errors": {"7707083893": "портал не ответил"}}}
+    assert by_id(build_report(site))["rkn_registry"]["status"] == "info"
 
 
 def test_penalties_come_from_registry():

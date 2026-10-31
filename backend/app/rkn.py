@@ -1,206 +1,170 @@
-"""Реестр операторов ПДн из открытых данных Роскомнадзора.
+"""Проверка оператора в реестре операторов ПДн Роскомнадзора (152-ФЗ, ст. 22).
 
-Набор «Реестр операторов, осуществляющих обработку персональных данных» публикуется на rkn.gov.ru/opendata
-в виде XML (обычно в zip). Сайт РКН доступен только с российских IP — импорт работает на VPS в РФ.
-Структура XML со временем меняется, поэтому парсер не привязан к точным именам тегов:
-запись — любой элемент, у которого есть дочерний элемент `inn`.
+Источник — поиск на портале pd.rkn.gov.ru по ИНН (официальный, бесплатный, без капчи на 10.2026).
+Машиночитаемой выгрузки реестра РКН не публикует: в каталоге rkn.gov.ru/opendata/list.csv его нет,
+у коммерческих API (DaData и т.п.) такого признака тоже нет.
+
+Портал не нагружаем: один запрос на ИНН, не чаще раза в REQUEST_INTERVAL секунд на процесс,
+результат кешируется в таблице rkn_checks. Портал доступен только с российских IP.
 """
 
 import asyncio
-import csv
-import io
 import logging
 import re
-import zipfile
-from collections.abc import Iterator
-from datetime import datetime, timezone
-from pathlib import Path
-from xml.etree.ElementTree import iterparse
+import time
+from datetime import timedelta
 
 import httpx
-from sqlalchemy import delete, insert, select
+from lxml import html as lh
 
-from .config import settings
-from .db import RknOperator, SessionLocal, kv_get, kv_set
+from .db import RknCheck, SessionLocal, kv_get, kv_set, utcnow
 
 log = logging.getLogger(__name__)
-KV_KEY = "rkn_import"
-# Сайт РКН отвечает 403 на запросы с «ботовым» User-Agent — представляемся обычным браузером
-BROWSER_HEADERS = {
+
+PORTAL = "https://pd.rkn.gov.ru/operators-registry/operators-list/"
+KV_KEY = "rkn_portal"
+REQUEST_INTERVAL = 2.0
+TTL_FOUND = timedelta(days=30)
+TTL_NOT_FOUND = timedelta(days=1)  # уведомление могли подать — перепроверяем чаще
+HEADERS = {
     "User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/140.0.0.0 Safari/537.36",
-    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+    "Accept": "text/html,application/xhtml+xml",
     "Accept-Language": "ru-RU,ru;q=0.9",
 }
-BATCH = 5000
+INN_IN_CELL_RE = re.compile(r"ИНН:\s*(\d{10}|\d{12})")
+NOT_FOUND_RE = re.compile(r"ничего\s+не\s+найдено|не\s+найден|нет\s+данных|записей\s+не\s+обнаружено", re.I)
+BLOCK_RE = re.compile(r"captcha|капч|доступ\s+(запрещ|ограничен)|too\s+many\s+requests", re.I)
 
-NAME_TAGS = ("name_full", "name", "fullname", "operator_name")
-REG_TAGS = ("regn", "pd_operator_num", "reg_number", "regnum", "num")
-DATE_TAGS = ("reg_date", "income_date", "startdate", "date_reg", "register_date")
-
-
-def _local(tag: str) -> str:
-    return tag.rsplit("}", 1)[-1].lower()
+_lock = asyncio.Lock()
+_last_request = 0.0
 
 
-DATASET_RE = re.compile(r'href="([^"]*7705846236-[^"/]*Operator[^"/]*/?)"', re.I)
-CATALOG_URL = "https://rkn.gov.ru/opendata/list.csv"
-OPERATORS_ROW_RE = re.compile(r"OperatorsPD|операторов[^;,]{0,60}персональн|персональн[^;,]{0,40}операторов", re.I)
-URL_RE = re.compile(r"(?:https?://[^\s;,\"']+|/opendata/[^\s;,\"']+)")
-DATA_FILE_RE = re.compile(r"data-\d{8}.*\.(zip|xml)$", re.I)
+class PortalUnavailable(Exception):
+    """Портал не ответил, вернул капчу или незнакомую разметку — результат неизвестен."""
 
 
-def _catalog_candidates(text: str) -> list[str]:
-    """Ссылки из строк каталога list.csv, относящихся к реестру операторов ПДн."""
-    found = []
-    for row in csv.reader(io.StringIO(text), delimiter=";" if text.count(";") > text.count(",") else ","):
-        line = " ".join(row)
-        if OPERATORS_ROW_RE.search(line):
-            found += [str(httpx.URL("https://rkn.gov.ru/").join(u.strip())) for u in URL_RE.findall(line)]
-    return list(dict.fromkeys(found))
+def card_url(reg_number: str) -> str:
+    return f"{PORTAL}?id={reg_number}"
 
 
-def _as_base(url: str) -> str:
-    """Адрес страницы набора: из ссылки на meta.csv или саму страницу."""
-    if url.lower().endswith((".csv", ".xml", ".json")) and "/meta" in url.lower():
-        return url.rsplit("/", 1)[0] + "/"
-    return url.rstrip("/") + "/"
+def search_url(inn: str) -> str:
+    return f"{PORTAL}?act=search&name_full=&inn={inn}&regn="
 
 
-async def _dataset_pages(client: httpx.AsyncClient) -> tuple[list[str], list[str]]:
-    """(страницы набора, прямые ссылки на файлы). Источники: настройка RKN_OPENDATA_URL,
-    каталог rkn.gov.ru/opendata/list.csv (текущий формат РКН) и HTML-страница каталога (старый формат)."""
-    pages = [settings.rkn_opendata_url.rstrip("/") + "/"]
-    files: list[str] = []
-    try:
-        r = await client.get(CATALOG_URL)
-        if r.status_code == 200:
-            for u in _catalog_candidates(r.content.decode("utf-8-sig", errors="replace")):
-                (files if DATA_FILE_RE.search(u) else pages).append(u if DATA_FILE_RE.search(u) else _as_base(u))
-    except httpx.HTTPError:
-        log.info("RKN catalog list.csv not available")
-    try:
-        r = await client.get("https://rkn.gov.ru/opendata/")
-        pages += [str(httpx.URL("https://rkn.gov.ru/opendata/").join(h)).rstrip("/") + "/"
-                  for h in DATASET_RE.findall(r.text)]
-    except httpx.HTTPError:
-        log.info("RKN opendata page not available")
-    return list(dict.fromkeys(pages)), list(dict.fromkeys(files))
+def parse_search(page: str, inn: str) -> list[dict]:
+    """Записи реестра для ИНН из страницы результатов поиска. Пустой список — не найден.
+    PortalUnavailable — страница не похожа на результаты поиска."""
+    if BLOCK_RE.search(page):
+        raise PortalUnavailable("портал запросил капчу или ограничил доступ")
+    doc = lh.document_fromstring(page)
+    tables = doc.xpath("//table[@id='ResList1']")
+    if not tables:
+        if NOT_FOUND_RE.search(doc.text_content()):
+            return []
+        raise PortalUnavailable("на странице нет таблицы результатов — изменилась разметка портала")
+    records = []
+    for tr in tables[0].xpath(".//tr[td]"):
+        cells = tr.xpath("./td")
+        if len(cells) < 4 or tr.getparent().tag == "thead":
+            continue
+        txt = [re.sub(r"\s+", " ", c.text_content()).strip() for c in cells]
+        m = INN_IN_CELL_RE.search(txt[1])
+        if not m or m.group(1) != inn:
+            continue
+        link = cells[1].xpath(".//a")
+        records.append({
+            "reg_number": txt[0],
+            "name": (link[0].text_content().strip() if link else txt[1].split("ИНН:")[0]).strip()[:500],
+            "basis": txt[2][:200],
+            "reg_date": txt[3],
+            "start_date": txt[4] if len(txt) > 4 else "",
+            "url": card_url(txt[0]),
+        })
+    return records
 
 
-async def _find_data_url(client: httpx.AsyncClient) -> str:
-    tried = []
-    pages, files = await _dataset_pages(client)
-    if files:
-        return sorted(files)[-1]  # имя файла содержит дату — берём самый свежий
-    for base in pages:
-        tried.append(base)
+def _inn_ok(inn: str) -> bool:
+    d = [int(c) for c in inn]
+    ctrl = lambda coefs: sum(c * x for c, x in zip(coefs, d)) % 11 % 10  # noqa: E731
+    if len(d) == 10:
+        return ctrl([2, 4, 10, 3, 5, 9, 4, 6, 8]) == d[9]
+    if len(d) == 12:
+        return ctrl([7, 2, 4, 10, 3, 5, 9, 4, 6, 8]) == d[10] and ctrl([3, 7, 2, 4, 10, 3, 5, 9, 4, 6, 8]) == d[11]
+    return False
+
+
+async def _fetch(client: httpx.AsyncClient, inn: str) -> list[dict]:
+    global _last_request
+    async with _lock:  # не чаще раза в REQUEST_INTERVAL: портал государственный, не создаём нагрузку
+        wait = REQUEST_INTERVAL - (time.monotonic() - _last_request)
+        if wait > 0:
+            await asyncio.sleep(wait)
         try:
-            r = await client.get(base + "meta.csv")
-            if r.status_code == 200:
-                for row in csv.reader(io.StringIO(r.content.decode("utf-8-sig", errors="replace"))):
-                    for cell in row:
-                        if re.search(r"data-\d{8}.*\.(zip|xml)", cell):
-                            return cell.strip()
-            r = await client.get(base)
-            if r.status_code != 200:
-                continue
-            links = re.findall(r'href="([^"]*data-\d{8}[^"]*\.(?:zip|xml))"', r.text)
-            if links:
-                return str(httpx.URL(base).join(sorted(links)[-1]))
+            r = await client.get(PORTAL, params={"act": "search", "name_full": "", "inn": inn, "regn": ""})
         except httpx.HTTPError as e:
-            log.info("RKN dataset page %s failed: %s", base, e)
-    raise RuntimeError("Не найден файл реестра операторов ПДн. Проверены адреса: " + ", ".join(tried)
-                       + ". Укажите актуальный адрес набора в RKN_OPENDATA_URL (.env).")
+            raise PortalUnavailable(f"портал не ответил: {type(e).__name__}") from e
+        finally:
+            _last_request = time.monotonic()
+    if r.status_code != 200:
+        raise PortalUnavailable(f"портал ответил HTTP {r.status_code}")
+    return parse_search(r.text, inn)
 
 
-def _parse(xml_stream) -> Iterator[list[dict]]:
-    batch: list[dict] = []
-    for _, el in iterparse(xml_stream, events=("end",)):
-        children = {_local(c.tag): (c.text or "").strip() for c in el}
-        inn = children.get("inn", "")
-        if inn and re.fullmatch(r"\d{10}|\d{12}", inn):
-            batch.append({
-                "inn": inn,
-                "name": next((children[t] for t in NAME_TAGS if children.get(t)), "")[:1000],
-                "reg_number": next((children[t] for t in REG_TAGS if children.get(t)), "")[:64],
-                "reg_date": next((children[t] for t in DATE_TAGS if children.get(t)), "")[:32],
-            })
-            el.clear()
-            if len(batch) >= BATCH:
-                yield batch
-                batch = []
-    if batch:
-        yield batch
-
-
-async def import_registry(ctx=None) -> dict:
-    started = datetime.now(timezone.utc).isoformat()
+async def _record_status(ok: bool, error: str = "") -> None:
     async with SessionLocal() as db:
-        await kv_set(db, KV_KEY, {**(await kv_get(db, KV_KEY)), "status": "running", "started_at": started})
+        meta = await kv_get(db, KV_KEY)
+        now = utcnow().isoformat()
+        meta["requests"] = meta.get("requests", 0) + 1
+        if ok:
+            meta.update(status="ok", last_ok=now, error="")
+        else:
+            meta.update(status="error", last_error=now, error=error, errors=meta.get("errors", 0) + 1)
+        await kv_set(db, KV_KEY, meta)
         await db.commit()
-    tmp_dir = Path(settings.data_dir) / "rkn"
-    tmp_dir.mkdir(parents=True, exist_ok=True)
-    path = tmp_dir / "registry.download"
-    try:
-        async with httpx.AsyncClient(timeout=httpx.Timeout(60, read=600), follow_redirects=True,
-                                     headers=BROWSER_HEADERS) as client:
-            url = await _find_data_url(client)
-            log.info("downloading RKN registry %s", url)
-            async with client.stream("GET", url) as r:
-                r.raise_for_status()
-                with path.open("wb") as fh:
-                    async for chunk in r.aiter_bytes(1 << 20):
-                        fh.write(chunk)
-        m = re.search(r"data-(\d{4})(\d{2})(\d{2})", url)
-        updated = f"{m.group(1)}-{m.group(2)}-{m.group(3)}" if m else ""
 
-        rows = 0
-        async with SessionLocal() as db:  # одна транзакция: до коммита поиск видит старые данные
-            await db.execute(delete(RknOperator))
-            zf = zipfile.ZipFile(path) if zipfile.is_zipfile(path) else None
-            try:
-                if zf:
-                    fh = zf.open(next(n for n in zf.namelist() if n.lower().endswith(".xml")))
-                else:
-                    fh = path.open("rb")
-                with fh:
-                    batches = _parse(fh)
-                    # разбор XML — в отдельном потоке, чтобы не блокировать сканирования в этом воркере
-                    while batch := await asyncio.to_thread(next, batches, None):
-                        await db.execute(insert(RknOperator), batch)
-                        rows += len(batch)
-            finally:
-                if zf:
-                    zf.close()
-            if rows == 0:
-                raise RuntimeError("В файле реестра не найдено ни одной записи — вероятно, изменился формат")
-            status = {"status": "ok", "rows": rows, "updated": updated, "source": url,
-                      "started_at": started, "finished_at": datetime.now(timezone.utc).isoformat()}
-            await kv_set(db, KV_KEY, status)
-            await db.commit()
-        log.info("RKN registry imported: %s rows", rows)
-        return status
-    except Exception as e:
-        log.exception("RKN import failed")
-        async with SessionLocal() as db:
-            prev = await kv_get(db, KV_KEY)
-            await kv_set(db, KV_KEY, {**prev, "status": "error", "error": str(e)[:500],
-                                      "finished_at": datetime.now(timezone.utc).isoformat()})
-            await db.commit()
-        return {"status": "error", "error": str(e)}
+
+async def check_inn(inn: str, client: httpx.AsyncClient | None = None, use_cache: bool = True) -> dict:
+    """{inn, found, records, checked_at, cached} или {inn, error}."""
+    async with SessionLocal() as db:
+        row = await db.get(RknCheck, inn)
+        if use_cache and row and utcnow() - row.checked_at < (TTL_FOUND if row.found else TTL_NOT_FOUND):
+            return {"inn": inn, "found": row.found, "records": row.records, "checked_at": row.checked_at.isoformat(),
+                    "cached": True}
+    own = client is None
+    client = client or httpx.AsyncClient(timeout=20, headers=HEADERS, follow_redirects=True)
+    try:
+        records = await _fetch(client, inn)
+    except PortalUnavailable as e:
+        log.warning("RKN portal unavailable for %s: %s", inn, e)
+        await _record_status(False, str(e))
+        return {"inn": inn, "error": str(e)}
     finally:
-        path.unlink(missing_ok=True)
+        if own:
+            await client.aclose()
+    await _record_status(True)
+    now = utcnow()
+    async with SessionLocal() as db:
+        row = await db.get(RknCheck, inn)
+        if row:
+            row.found, row.records, row.checked_at = bool(records), records, now
+        else:
+            db.add(RknCheck(inn=inn, found=bool(records), records=records, checked_at=now))
+        await db.commit()
+    return {"inn": inn, "found": bool(records), "records": records, "checked_at": now.isoformat(), "cached": False}
 
 
 async def lookup(inns: list[str]) -> dict:
-    """Данные для проверки rkn_registry: загружен ли реестр и записи по найденным ИНН."""
-    async with SessionLocal() as db:
-        meta = await kv_get(db, KV_KEY)
-        if not meta.get("rows"):
-            return {"loaded": False}
-        matches: dict[str, list[dict]] = {inn: [] for inn in inns}
-        if inns:
-            res = await db.execute(select(RknOperator).where(RknOperator.inn.in_(inns)).limit(50))
-            for op in res.scalars():
-                matches[op.inn].append({"name": op.name, "reg_number": op.reg_number, "reg_date": op.reg_date})
-    return {"loaded": True, "updated": meta.get("updated"), "matches": matches}
+    """Данные для проверки rkn_registry. Проверяем до трёх корректных ИНН, найденных на сайте."""
+    inns = [i for i in dict.fromkeys(inns) if _inn_ok(i)][:3]
+    if not inns:
+        return {"checked": False}
+    async with httpx.AsyncClient(timeout=20, headers=HEADERS, follow_redirects=True) as client:
+        results = [await check_inn(inn, client) for inn in inns]
+    ok = [r for r in results if "error" not in r]
+    return {
+        "checked": bool(ok),
+        "source": "pd.rkn.gov.ru",
+        "matches": {r["inn"]: r["records"] for r in ok},
+        "checked_at": max((r["checked_at"] for r in ok), default=None),
+        "errors": {r["inn"]: r["error"] for r in results if "error" in r},
+    }

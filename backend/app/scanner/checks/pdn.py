@@ -288,30 +288,33 @@ def find_inns(site: SiteData) -> list[str]:
 
 
 def check_rkn_registry(site: SiteData) -> Finding:
-    """Сверка с реестром операторов ПДн (открытые данные РКН, загружаются воркером ежедневно)."""
+    """Сверка с реестром операторов ПДн на портале pd.rkn.gov.ru (результат кладёт воркер в profile["rkn"])."""
     inns = find_inns(site)
     rkn = site.profile.get("rkn") or {}
     base = dict(id="rkn_registry", category=CAT, title="Уведомление в реестре операторов ПДн", law="152-ФЗ, ст. 22")
-    manual = "Проверка вручную: pd.rkn.gov.ru → «Реестр операторов»."
+    manual = "Проверка вручную: pd.rkn.gov.ru → «Реестр операторов» → поиск по ИНН."
     if not inns:
         return Finding(**base, status="info", severity="medium",
                        summary="ИНН владельца на сайте не найден — сверить с реестром операторов ПДн невозможно.",
                        recommendation="Укажите ИНН на сайте. " + manual)
-    if not rkn.get("loaded"):
+    if not rkn.get("checked"):
         return Finding(**base, status="info", severity="medium", evidence=inns[:3],
-                       summary=f"Проверьте ИНН {', '.join(inns[:3])} в реестре операторов ПДн.",
+                       summary=f"Не удалось получить ответ от портала Роскомнадзора. Проверьте ИНН {', '.join(inns[:3])} "
+                       "в реестре операторов ПДн вручную.",
                        recommendation=manual)
-    found = {inn: recs for inn, recs in (rkn.get("matches") or {}).items() if recs}
-    as_of = f" (данные РКН на {rkn['updated']})" if rkn.get("updated") else ""
+    matches = rkn.get("matches") or {}
+    found = {inn: recs for inn, recs in matches.items() if recs}
+    as_of = f" (pd.rkn.gov.ru, {rkn['checked_at'][:10]})" if rkn.get("checked_at") else ""
     if found:
-        ev = [f"ИНН {inn}: рег. № {r.get('reg_number') or '—'}" + (f" от {r['reg_date']}" if r.get("reg_date") else "")
+        ev = [f"ИНН {inn}: рег. № {r['reg_number']}, уведомление от {r.get('reg_date') or '—'} — {r.get('url', '')}"
               for inn, recs in found.items() for r in recs[:1]]
         return Finding(**base, status="pass", severity="low", evidence=ev,
                        summary="Оператор найден в реестре операторов, осуществляющих обработку ПДн" + as_of + ".")
+    not_found = list(matches)
     return Finding(
-        **base, status="fail", severity="medium", evidence=inns[:3],
-        summary=f"ИНН {', '.join(inns[:3])} не найден в реестре операторов ПДн{as_of}. Если уведомление подано "
-        "недавно, оно может ещё не попасть в открытые данные.",
+        **base, status="fail", severity="medium", evidence=[f"ИНН {i} — нет в реестре" for i in not_found[:3]],
+        summary=f"ИНН {', '.join(not_found[:3])} не найден в реестре операторов ПДн{as_of}. Внесение в реестр занимает "
+        "до 30 дней после подачи уведомления — если оно подано недавно, записи может ещё не быть.",
         recommendation="Подайте уведомление об обработке ПДн на pd.rkn.gov.ru (или через Госуслуги). "
         "Если уведомление уже подано — укажите его номер в отчёте, мы учтём это при следующей проверке.",
     )

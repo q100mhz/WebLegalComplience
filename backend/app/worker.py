@@ -10,7 +10,7 @@ from sqlalchemy import update
 
 from . import rkn
 from .config import settings, shots_dir
-from .db import Scan, SessionLocal, kv_get, utcnow
+from .db import Scan, SessionLocal, utcnow
 from .scanner.checks.pdn import find_inns
 from .scanner.crawler import BlockedError, crawl
 from .scanner.report import build_report
@@ -72,30 +72,12 @@ async def cleanup_shots(ctx) -> None:
             shutil.rmtree(d, ignore_errors=True)
 
 
-async def startup(ctx) -> None:
-    # Первый запуск: реестр РКН ещё не загружен — ставим импорт в очередь
-    try:
-        async with SessionLocal() as db:
-            meta = await kv_get(db, rkn.KV_KEY)
-    except Exception:  # noqa: BLE001 — таблицы ещё создаёт API; импорт запустится по расписанию
-        log.warning("database not ready, skipping initial RKN import")
-        return
-    if not meta.get("rows") and meta.get("status") != "running":
-        await ctx["redis"].enqueue_job("import_rkn", _job_id="import_rkn")
-
-
-async def import_rkn(ctx) -> dict:
-    return await rkn.import_registry(ctx)
-
-
 class WorkerSettings:
-    functions = [run_scan, import_rkn]
+    functions = [run_scan]
     cron_jobs = [
-        cron(import_rkn, hour=3, minute=30, timeout=3600, unique=True),
         cron(cleanup_shots, hour=4, minute=30),
     ]
-    on_startup = startup
     redis_settings = RedisSettings.from_dsn(settings.redis_url)
-    max_jobs = settings.worker_concurrency + 1
-    job_timeout = 3600
+    max_jobs = settings.worker_concurrency
+    job_timeout = settings.scan_timeout_s + 120  # + сверка с порталом РКН
     max_tries = 1

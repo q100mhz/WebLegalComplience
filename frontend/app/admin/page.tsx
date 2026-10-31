@@ -11,7 +11,7 @@ interface Stats {
   top_violations: { id: string; title: string; fails: number; warns: number }[];
   site_types: { name: string; count: number }[];
   platforms: { name: string; count: number }[];
-  rkn: { status?: string; rows?: number; updated?: string; finished_at?: string; error?: string };
+  rkn: { status?: string; last_ok?: string; error?: string; requests?: number };
 }
 
 const TILES: [string, string][] = [
@@ -40,11 +40,11 @@ export default function Dashboard() {
   return (
     <>
       <h1>Дашборд</h1>
-      {(s.totals.feedback_new || s.totals.rules_unverified) ? (
+      {(s.totals.feedback_new || s.totals.rules_unverified || s.rkn.status === "error") ? (
         <div className="alerts">
           {!!s.totals.feedback_new && <Link href="/admin/feedback?status=new" className="pill warn">Новых обращений: {s.totals.feedback_new}</Link>}
           {!!s.totals.rules_unverified && <Link href="/admin/rules" className="pill fail">Не сверено правил: {s.totals.rules_unverified}</Link>}
-          {s.rkn.status !== "ok" && <Link href="/admin/rkn" className="pill fail">Реестр РКН: {s.rkn.status || "не загружен"}</Link>}
+          {s.rkn.status === "error" && <Link href="/admin/rkn" className="pill fail">Портал РКН: ошибка связи</Link>}
         </div>
       ) : null}
 
@@ -99,10 +99,10 @@ export default function Dashboard() {
       </div>
 
       <p className="meta">
-        Реестр РКН: {s.rkn.status || "не загружен"}
-        {s.rkn.rows ? ` · ${s.rkn.rows.toLocaleString("ru-RU")} записей · данные на ${s.rkn.updated} · обновлён ${fmtDate(s.rkn.finished_at)}` : ""}
+        Портал РКН: {s.rkn.status === "ok" ? "работает" : s.rkn.status === "error" ? "ошибка связи" : "ещё не было запросов"}
+        {s.rkn.last_ok ? ` · последний успешный запрос ${fmtDate(s.rkn.last_ok)}` : ""}
       </p>
-      {s.rkn.error && <p className="form-error">Ошибка импорта реестра РКН: {s.rkn.error} (<Link href="/admin/rkn">подробнее</Link>)</p>}
+      {s.rkn.status === "error" && s.rkn.error && <p className="form-error">Портал РКН: {s.rkn.error} (<Link href="/admin/rkn">подробнее</Link>)</p>}
     </>
   );
 }

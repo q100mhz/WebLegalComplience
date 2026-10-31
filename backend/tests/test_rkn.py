@@ -1,37 +1,46 @@
-import io
+from pathlib import Path
 
-from app.rkn import _parse
+import pytest
 
-XML = """<?xml version="1.0" encoding="utf-8"?>
-<rkn:register xmlns:rkn="http://rsoc.ru">
-  <rkn:record>
-    <rkn:regn>77-14-000123</rkn:regn>
-    <rkn:name_full>ПАО Сбербанк</rkn:name_full>
-    <rkn:inn>7707083893</rkn:inn>
-    <rkn:income_date>2014-03-01</rkn:income_date>
-  </rkn:record>
-  <rkn:record><rkn:inn>bad</rkn:inn></rkn:record>
-  <rkn:record><rkn:pd_operator_num>1</rkn:pd_operator_num><rkn:inn>500100732259</rkn:inn></rkn:record>
-</rkn:register>""".encode()
+from app.rkn import PortalUnavailable, _inn_ok, card_url, parse_search
+
+FIX = Path(__file__).parent / "fixtures"
 
 
-def test_parse_registry_xml():
-    rows = [r for batch in _parse(io.BytesIO(XML)) for r in batch]
-    assert [r["inn"] for r in rows] == ["7707083893", "500100732259"]
-    assert rows[0]["reg_number"] == "77-14-000123"
-    assert rows[0]["name"] == "ПАО Сбербанк"
-    assert rows[0]["reg_date"] == "2014-03-01"
-    assert rows[1]["reg_number"] == "1"
+def test_parse_real_portal_result():
+    page = (FIX / "rkn_search_7707083893.html").read_text(encoding="utf-8")
+    recs = parse_search(page, "7707083893")
+    assert len(recs) == 1
+    r = recs[0]
+    assert r["reg_number"] == "11-0187199"
+    assert r["name"] == 'Публичное акционерное общество "Сбербанк России"'
+    assert r["reg_date"] == "24.03.2011" and r["start_date"] == "26.07.1991"
+    assert "229" in r["basis"]
+    assert r["url"] == card_url("11-0187199")
 
 
-def test_catalog_finds_operators_dataset():
-    from app.rkn import _as_base, _catalog_candidates
-    csv_text = (
-        "property;title;url\n"
-        "7705846236-NewsRSS;Новости;https://rkn.gov.ru/opendata/7705846236-NewsRSS/\n"
-        "7705846236-OperatorsPD;Реестр операторов, осуществляющих обработку персональных данных;"
-        "https://rkn.gov.ru/opendata/7705846236-OperatorsPD/meta.csv\n"
-    )
-    urls = _catalog_candidates(csv_text)
-    assert urls == ["https://rkn.gov.ru/opendata/7705846236-OperatorsPD/meta.csv"]
-    assert _as_base(urls[0]) == "https://rkn.gov.ru/opendata/7705846236-OperatorsPD/"
+def test_other_inn_rows_are_ignored():
+    page = (FIX / "rkn_search_7707083893.html").read_text(encoding="utf-8")
+    assert parse_search(page, "7736207543") == []
+
+
+def test_empty_result_table_means_not_found():
+    page = """<html><body><table id="ResList1"><thead><tr><td>Регистр. номер</td><td>Наименование</td>
+    <td>Основание</td><td>Дата</td><td>Дата</td></tr></thead></table></body></html>"""
+    assert parse_search(page, "7707083893") == []
+
+
+def test_search_form_without_results_is_not_a_negative_answer():
+    # Страница без таблицы результатов (например, сменилась разметка) — «не знаем», а не «не найден»
+    page = (FIX / "rkn_operators_list.html").read_text(encoding="utf-8")
+    with pytest.raises(PortalUnavailable):
+        parse_search(page, "7707083893")
+
+
+def test_captcha_is_unavailable():
+    with pytest.raises(PortalUnavailable):
+        parse_search("<html><body>Введите код с картинки (captcha)</body></html>", "7707083893")
+
+
+def test_inn_checksum():
+    assert _inn_ok("7707083893") and not _inn_ok("7707083890")

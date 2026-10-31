@@ -79,16 +79,15 @@ class Feedback(Base):
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow, index=True)
 
 
-class RknOperator(Base):
-    """Реестр операторов ПДн из открытых данных Роскомнадзора (перезаливается целиком)."""
+class RknCheck(Base):
+    """Кеш проверок ИНН на портале pd.rkn.gov.ru (реестр операторов ПДн)."""
 
-    __tablename__ = "rkn_operators"
+    __tablename__ = "rkn_checks"
 
-    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
-    inn: Mapped[str] = mapped_column(String(12), index=True)
-    name: Mapped[str] = mapped_column(Text, default="")
-    reg_number: Mapped[str] = mapped_column(String(64), default="")
-    reg_date: Mapped[str] = mapped_column(String(32), default="")
+    inn: Mapped[str] = mapped_column(String(12), primary_key=True)
+    found: Mapped[bool] = mapped_column(Boolean, default=False)
+    records: Mapped[list] = mapped_column(JSONB, default=list)
+    checked_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow, index=True)
 
 
 class KV(Base):

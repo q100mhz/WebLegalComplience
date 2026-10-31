@@ -15,7 +15,7 @@ from sqlalchemy import Date, cast, func, or_, select, text
 
 from . import rkn
 from .config import settings, shots_dir
-from .db import Feedback, Rule, Scan, SessionLocal, kv_get, utcnow
+from .db import Feedback, RknCheck, Rule, Scan, SessionLocal, kv_get, utcnow
 
 router = APIRouter(prefix="/api/admin")
 COOKIE = "wlc_admin"
@@ -351,17 +351,19 @@ async def update_feedback(fb_id: int, body: FeedbackUpdate):
 @router.get("/rkn", dependencies=[Depends(require_admin)])
 async def rkn_status():
     async with SessionLocal() as db:
-        return await kv_get(db, rkn.KV_KEY)
-
-
-@router.post("/rkn/import", dependencies=[Depends(require_admin)])
-async def rkn_import(request: Request):
-    job = await request.app.state.redis.enqueue_job("import_rkn", _job_id=f"import_rkn:{datetime.now():%Y%m%d%H%M}")
-    return {"queued": job is not None}
+        meta = await kv_get(db, rkn.KV_KEY)
+        total = (await db.execute(select(func.count()).select_from(RknCheck))).scalar_one()
+        found = (await db.execute(select(func.count()).select_from(RknCheck).where(RknCheck.found.is_(True)))).scalar_one()
+        recent = (await db.execute(select(RknCheck).order_by(RknCheck.checked_at.desc()).limit(20))).scalars().all()
+    return {
+        **meta, "cached": total, "cached_found": found,
+        "recent": [{"inn": r.inn, "found": r.found, "records": r.records, "checked_at": r.checked_at.isoformat()}
+                   for r in recent],
+    }
 
 
 @router.get("/rkn/search", dependencies=[Depends(require_admin)])
 async def rkn_search(inn: str):
     if not re.fullmatch(r"\d{10}|\d{12}", inn):
         raise HTTPException(422, "ИНН должен содержать 10 или 12 цифр")
-    return await rkn.lookup([inn])
+    return await rkn.check_inn(inn, use_cache=False)

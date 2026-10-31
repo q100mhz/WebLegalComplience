@@ -29,9 +29,6 @@ class Settings(BaseSettings):
     secret_key: str = "dev-secret-change-me"
     cookie_secure: bool = True
 
-    # Открытые данные РКН: реестр операторов ПДн
-    rkn_opendata_url: str = "https://rkn.gov.ru/opendata/7705846236-OperatorsPD/"
-
     user_agent: str = (
         "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) "
         "Chrome/140.0.0.0 Safari/537.36 WebLegalComplianceBot/1.0 "
