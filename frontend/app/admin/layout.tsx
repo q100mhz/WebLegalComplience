@@ -7,6 +7,7 @@ import { adminFetch } from "@/lib/admin";
 const NAV = [
   ["/admin", "Дашборд"],
   ["/admin/scans", "Проверки"],
+  ["/admin/batches", "Пакетная проверка"],
   ["/admin/sites", "Сайты"],
   ["/admin/feedback", "Обратная связь"],
   ["/admin/rules", "Реестр нарушений"],

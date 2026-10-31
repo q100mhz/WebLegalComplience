@@ -29,7 +29,7 @@ export default function ScanPage({ params }: { params: Promise<{ id: string }> }
         const s = await getScan(id);
         if (stopped) return;
         setScan(s);
-        if (s.status === "queued" || s.status === "running") timer = setTimeout(poll, 2000);
+        if (s.status === "queued" || s.status === "running" || s.status === "pending") timer = setTimeout(poll, 3000);
       } catch (e) {
         if (!stopped) setError(e instanceof Error ? e.message : "Ошибка загрузки");
       }
@@ -43,6 +43,7 @@ export default function ScanPage({ params }: { params: Promise<{ id: string }> }
 
   if (error) return <Message title="Не удалось загрузить проверку" text={error} />;
   if (!scan) return <Progress text="Загрузка…" />;
+  if (scan.status === "cancelled") return <Message title={`Проверка ${scan.host} отменена`} text="Проверка была отменена администратором." />;
   if (scan.status === "failed")
     return <Message title={`Не удалось проверить ${scan.host}`} text={scan.error || "Неизвестная ошибка"} />;
   if (scan.status !== "done" || !scan.report) {
@@ -51,9 +52,9 @@ export default function ScanPage({ params }: { params: Promise<{ id: string }> }
       <div className="container">
         <div className="progress-box">
           <div className="spinner" />
-          <h2>{scan.status === "queued" ? "Проверка в очереди…" : `Сканируем ${scan.host}`}</h2>
+          <h2>{scan.status === "running" ? `Сканируем ${scan.host}` : "Проверка в очереди…"}</h2>
           <div className="bar">
-            <div style={{ width: `${scan.status === "queued" ? 2 : pct}%` }} />
+            <div style={{ width: `${scan.status === "running" ? pct : 2}%` }} />
           </div>
           <div className="meta">
             Проанализировано страниц: {scan.pages_scanned} из {scan.max_pages}

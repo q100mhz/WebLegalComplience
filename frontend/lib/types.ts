@@ -55,7 +55,7 @@ export interface Scan {
   id: string;
   url: string;
   host: string;
-  status: "queued" | "running" | "done" | "failed";
+  status: "pending" | "queued" | "running" | "done" | "failed" | "cancelled";
   pages_scanned: number;
   max_pages: number;
   current_url: string | null;

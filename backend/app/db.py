@@ -1,7 +1,7 @@
 import uuid
 from datetime import datetime, timezone
 
-from sqlalchemy import Boolean, DateTime, Integer, String, Text, select
+from sqlalchemy import Boolean, DateTime, Integer, String, Text, select, text
 from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
@@ -26,7 +26,7 @@ class Scan(Base):
     id: Mapped[str] = mapped_column(String(36), primary_key=True, default=lambda: str(uuid.uuid4()))
     url: Mapped[str] = mapped_column(Text)
     host: Mapped[str] = mapped_column(String(255), index=True)
-    # queued | running | done | failed
+    # pending (ждёт своей очереди в пакете) | queued | running | done | failed | cancelled
     status: Mapped[str] = mapped_column(String(16), default="queued", index=True)
     pages_scanned: Mapped[int] = mapped_column(Integer, default=0)
     current_url: Mapped[str | None] = mapped_column(Text, nullable=True)
@@ -36,6 +36,18 @@ class Scan(Base):
     client_ip: Mapped[str | None] = mapped_column(String(64), nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow, index=True)
     finished_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    batch_id: Mapped[str | None] = mapped_column(String(36), nullable=True, index=True)
+
+
+class Batch(Base):
+    """Пакетная проверка списка сайтов из админки."""
+
+    __tablename__ = "batches"
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=lambda: str(uuid.uuid4()))
+    name: Mapped[str] = mapped_column(String(255), default="")
+    total: Mapped[int] = mapped_column(Integer, default=0)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow, index=True)
 
 
 class Rule(Base):
@@ -117,6 +129,9 @@ async def init_db() -> None:
 
     async with engine.begin() as conn:
         await conn.run_sync(Base.metadata.create_all)
+        # create_all не добавляет колонки в существующие таблицы — простые миграции здесь
+        await conn.execute(text("ALTER TABLE scans ADD COLUMN IF NOT EXISTS batch_id VARCHAR(36)"))
+        await conn.execute(text("CREATE INDEX IF NOT EXISTS ix_scans_batch_id ON scans (batch_id)"))
     # Добавляем новые правила из кода, не трогая отредактированные в админке
     async with SessionLocal() as db:
         existing = set((await db.execute(select(Rule.id))).scalars())

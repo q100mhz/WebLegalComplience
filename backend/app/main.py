@@ -109,7 +109,8 @@ async def create_scan(body: ScanIn, request: Request):
         existing = (
             await db.execute(
                 select(Scan)
-                .where(Scan.host == site_key(host), Scan.created_at >= since, Scan.status != "failed")
+                .where(Scan.host == site_key(host), Scan.created_at >= since, Scan.status != "failed",
+                       Scan.batch_id.is_(None))  # пакетные проверки ждут своей очереди — посетителю не отдаём
                 .order_by(Scan.created_at.desc())
                 .limit(1)
             )

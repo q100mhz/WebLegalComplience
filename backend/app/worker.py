@@ -8,7 +8,7 @@ from arq import cron
 from arq.connections import RedisSettings
 from sqlalchemy import update
 
-from . import rkn
+from . import batches, rkn
 from .config import settings, shots_dir
 from .db import Scan, SessionLocal, utcnow
 from .scanner.checks.pdn import find_inns
@@ -29,7 +29,7 @@ async def _update(scan_id: str, **values) -> None:
 async def run_scan(ctx, scan_id: str) -> None:
     async with SessionLocal() as db:
         scan = await db.get(Scan, scan_id)
-    if not scan:
+    if not scan or scan.status != "queued":  # отменена или уже обработана (старое задание после перезапуска)
         return
     await _update(scan_id, status="running")
     last = 0.0
@@ -65,6 +65,9 @@ async def run_scan(ctx, scan_id: str) -> None:
         # Подробности для админки (в публичный отчёт не попадают)
         diag = e.diag if isinstance(e, BlockedError) else {"exception": f"{type(e).__name__}: {str(e)[:1000]}"}
         await _update(scan_id, status="failed", error=msg, finished_at=utcnow(), result={"diagnostics": diag})
+    finally:
+        if scan.batch_id:
+            await batches.pump(ctx["redis"])
 
 
 async def cleanup_shots(ctx) -> None:
@@ -77,11 +80,24 @@ async def cleanup_shots(ctx) -> None:
             shutil.rmtree(d, ignore_errors=True)
 
 
+async def pump_batches(ctx) -> None:
+    await batches.pump(ctx["redis"])  # страховка: подача пакета не должна останавливаться
+
+
+async def startup(ctx) -> None:
+    try:
+        await batches.recover_after_restart(ctx["redis"])
+    except Exception:  # noqa: BLE001 — таблицы может ещё создавать API; подачу подхватит cron
+        log.warning("batch recovery skipped", exc_info=True)
+
+
 class WorkerSettings:
     functions = [run_scan]
     cron_jobs = [
         cron(cleanup_shots, hour=4, minute=30),
+        cron(pump_batches, minute=set(range(0, 60, 5))),
     ]
+    on_startup = startup
     redis_settings = RedisSettings.from_dsn(settings.redis_url)
     max_jobs = settings.worker_concurrency
     job_timeout = settings.scan_timeout_s + 120  # + сверка с порталом РКН

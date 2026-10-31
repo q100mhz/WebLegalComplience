@@ -10,15 +10,17 @@ import tempfile
 import time
 import zipfile
 from datetime import datetime, timedelta
+from urllib.parse import urlsplit
 
 from fastapi import APIRouter, Cookie, Depends, HTTPException, Request, Response
 from fastapi.responses import FileResponse, StreamingResponse
 from pydantic import BaseModel
-from sqlalchemy import Date, cast, func, or_, select, text
+from sqlalchemy import Date, cast, func, or_, select, text, update
 
-from . import rkn
+from . import batches, rkn
 from .config import settings, shots_dir
-from .db import Feedback, RknCheck, Rule, Scan, SessionLocal, kv_get, utcnow
+from .db import Batch, Feedback, RknCheck, Rule, Scan, SessionLocal, kv_get, utcnow
+from .scanner.urls import UrlError, normalize_input, site_key
 
 router = APIRouter(prefix="/api/admin")
 COOKIE = "wlc_admin"
@@ -149,15 +151,17 @@ def _scan_row(s: Scan) -> dict:
         "grade": r.get("grade"), "counts": r.get("counts"), "pages_scanned": s.pages_scanned,
         "type": (r.get("profile") or {}).get("primary_type"),
         "platform": ((r.get("profile") or {}).get("platform") or {}).get("name"),
-        "client_ip": s.client_ip, "error": s.error,
+        "client_ip": s.client_ip, "error": s.error, "batch_id": s.batch_id,
         "created_at": s.created_at.isoformat(), "finished_at": s.finished_at.isoformat() if s.finished_at else None,
     }
 
 
 @router.get("/scans", dependencies=[Depends(require_admin)])
-async def scans(q: str = "", status: str = "", page: int = 1, per_page: int = 50):
+async def scans(q: str = "", status: str = "", page: int = 1, per_page: int = 50, batch: str = ""):
     per_page = min(max(per_page, 1), 200)
     query = select(Scan)
+    if batch:
+        query = query.where(Scan.batch_id == batch)
     if q:
         query = query.where(or_(Scan.host.ilike(f"%{q}%"), Scan.url.ilike(f"%{q}%"), Scan.client_ip == q))
     if status:
@@ -191,14 +195,113 @@ async def scan_shot(scan_id: str, name: str):
     return FileResponse(path, media_type="image/jpeg")
 
 
+# ---------- Пакетные проверки ----------
+
+MAX_BATCH = 500
+
+
+class BatchIn(BaseModel):
+    name: str = ""
+    urls: str
+
+
+@router.post("/batches", dependencies=[Depends(require_admin)])
+async def create_batch(body: BatchIn, request: Request):
+    raw = [u for u in re.split(r"[\s,;]+", body.urls) if u.strip()]
+    valid: dict[str, str] = {}
+    invalid: list[str] = []
+    for u in raw:
+        try:
+            url = normalize_input(u)
+        except UrlError:
+            invalid.append(u[:200])
+            continue
+        valid.setdefault(site_key(urlsplit(url).hostname or ""), url)  # один сайт — одна проверка
+    if not valid:
+        raise HTTPException(422, "В списке нет ни одного корректного адреса сайта")
+    if len(valid) > MAX_BATCH:
+        raise HTTPException(422, f"Не больше {MAX_BATCH} сайтов в одном пакете (в списке {len(valid)})")
+    async with SessionLocal() as db:
+        batch = Batch(name=body.name.strip()[:255] or f"Пакет от {utcnow():%d.%m.%Y %H:%M}", total=len(valid))
+        db.add(batch)
+        await db.flush()
+        base = utcnow()
+        for i, (host, url) in enumerate(valid.items()):
+            # порядок подачи — порядок в списке
+            db.add(Scan(url=url, host=host, status="pending", client_ip="admin-batch", batch_id=batch.id,
+                        created_at=base + timedelta(microseconds=i)))
+        await db.commit()
+    await batches.pump(request.app.state.redis)
+    return {"id": batch.id, "total": len(valid), "invalid": invalid, "duplicates": len(raw) - len(valid) - len(invalid)}
+
+
+async def _batch_rows(db, ids: list[str]) -> dict[str, dict]:
+    rows = (await db.execute(
+        select(Scan.batch_id, Scan.status, func.count(), func.avg(Scan.score), func.max(Scan.finished_at))
+        .where(Scan.batch_id.in_(ids)).group_by(Scan.batch_id, Scan.status)
+    )).all()
+    out: dict[str, dict] = {i: {"counts": {}, "avg_score": None, "last_finished": None} for i in ids}
+    for bid, st, n, avg, last in rows:
+        o = out[bid]
+        o["counts"][st] = n
+        if st == "done" and avg is not None:
+            o["avg_score"] = round(avg)
+        if last and (o["last_finished"] is None or last > o["last_finished"]):
+            o["last_finished"] = last
+    return out
+
+
+def _batch_view(b: Batch, agg: dict) -> dict:
+    c = agg["counts"]
+    finished = c.get("done", 0) + c.get("failed", 0) + c.get("cancelled", 0)
+    left = c.get("pending", 0) + c.get("queued", 0) + c.get("running", 0)
+    eta = None
+    if left and finished and agg["last_finished"]:
+        per_site = (agg["last_finished"] - b.created_at).total_seconds() / max(finished - c.get("cancelled", 0), 1)
+        eta = round(per_site * left / 60)
+    return {"id": b.id, "name": b.name, "total": b.total, "created_at": b.created_at.isoformat(), "counts": c,
+            "finished": finished, "left": left, "avg_score": agg["avg_score"], "eta_minutes": eta,
+            "state": "running" if left else "done"}
+
+
+@router.get("/batches", dependencies=[Depends(require_admin)])
+async def list_batches():
+    async with SessionLocal() as db:
+        items = (await db.execute(select(Batch).order_by(Batch.created_at.desc()).limit(100))).scalars().all()
+        agg = await _batch_rows(db, [b.id for b in items])
+    return [_batch_view(b, agg[b.id]) for b in items]
+
+
+@router.get("/batches/{batch_id}", dependencies=[Depends(require_admin)])
+async def batch_detail(batch_id: str):
+    async with SessionLocal() as db:
+        b = await db.get(Batch, batch_id)
+        if not b:
+            raise HTTPException(404, "Пакет не найден")
+        agg = await _batch_rows(db, [b.id])
+        scans = (await db.execute(select(Scan).where(Scan.batch_id == b.id).order_by(Scan.created_at, Scan.id))).scalars().all()
+    return {**_batch_view(b, agg[b.id]), "scans": [_scan_row(s) for s in scans]}
+
+
+@router.post("/batches/{batch_id}/cancel", dependencies=[Depends(require_admin)])
+async def cancel_batch(batch_id: str):
+    async with SessionLocal() as db:
+        res = await db.execute(update(Scan).where(Scan.batch_id == batch_id, Scan.status == "pending")
+                               .values(status="cancelled", error="Отменено", finished_at=utcnow()))
+        await db.commit()
+    return {"cancelled": res.rowcount}
+
+
 @router.get("/export.zip", dependencies=[Depends(require_admin)])
-async def export_zip(days: int = 30, status: str = "", limit: int = 500):
+async def export_zip(days: int = 30, status: str = "", limit: int = 500, batch: str = ""):
     """История проверок для аудита правил: scans.json (полные результаты, без IP и контактов пользователей),
     rules.json (реестр), скриншоты и снимки собранных данных (site.json.gz) каждой проверки."""
     since = utcnow() - timedelta(days=max(1, min(days, 365)))
-    query = select(Scan).where(Scan.created_at >= since).order_by(Scan.created_at.desc()).limit(max(1, min(limit, 2000)))
+    query = select(Scan).order_by(Scan.created_at.desc())
     if status:
         query = query.where(Scan.status == status)
+    # пакет выгружается целиком, без ограничения по дате; иначе — история за период
+    query = query.where(Scan.batch_id == batch) if batch else query.where(Scan.created_at >= since).limit(max(1, min(limit, 2000)))
     async with SessionLocal() as db:
         scans = (await db.execute(query)).scalars().all()
         fb = (await db.execute(select(Feedback).where(Feedback.scan_id.in_([s.id for s in scans])))).scalars().all()

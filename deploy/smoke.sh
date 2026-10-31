@@ -34,5 +34,21 @@ curl -fsS -c "$C" -X POST "$BASE/api/admin/login" -H 'Content-Type: application/
   -d "{\"login\":\"$ADMIN_LOGIN\",\"password\":\"$ADMIN_PASSWORD\"}" >/dev/null
 curl -fsS -b "$C" "$BASE/api/admin/stats" | python3 -c 'import sys,json;d=json.load(sys.stdin);print("totals", d["totals"]);print("РКН", d["rkn"])'
 curl -fsS -b "$C" "$BASE/api/admin/rules" | python3 -c 'import sys,json;print("правил в реестре:", len(json.load(sys.stdin)))'
-rm -f "$C"
+step "пакетная проверка (2 сайта) и выгрузка архива"
+B=$(curl -fsS -b "$C" -X POST "$BASE/api/admin/batches" -H 'Content-Type: application/json' \
+  -d '{"name":"smoke-test","urls":"tilda.ru\nexample.com"}' | python3 -c 'import sys,json;print(json.load(sys.stdin)["id"])')
+echo "batch $B"
+for i in $(seq 1 120); do
+  st=$(curl -fsS -b "$C" "$BASE/api/admin/batches/$B" | python3 -c 'import sys,json;d=json.load(sys.stdin);print(d["state"], d["finished"], "/", d["total"], d["counts"])')
+  echo "  $st"; case "$st" in done*) break;; esac; sleep 5
+done
+curl -fsS -b "$C" "$BASE/api/admin/export.zip?batch=$B" -o "$J.zip"
+python3 - "$J.zip" <<'PY'
+import json, sys, zipfile
+z = zipfile.ZipFile(sys.argv[1]); scans = json.loads(z.read("scans.json"))
+snaps = [n for n in z.namelist() if n.endswith("site.json.gz")]
+print("в архиве проверок:", len(scans), "| снимков данных:", len(snaps), "| файлов:", len(z.namelist()))
+assert len(scans) == 2 and snaps, "в архиве нет снимков данных"
+PY
+rm -f "$C" "$J.zip"
 echo; echo "SMOKE OK"
