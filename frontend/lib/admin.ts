@@ -27,7 +27,7 @@ export const STATUS_RU: Record<string, string> = {
 
 export interface BatchView {
   id: string; name: string; total: number; created_at: string; counts: Record<string, number>;
-  finished: number; left: number; avg_score: number | null; eta_minutes: number | null; state: "running" | "done";
+  finished: number; left: number; avg_score: number | null; eta_minutes: number | null; state: "running" | "paused" | "done";
 }
 
 export const fmtEta = (m: number | null) =>

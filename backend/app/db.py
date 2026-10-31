@@ -50,6 +50,7 @@ class Batch(Base):
     name: Mapped[str] = mapped_column(String(255), default="")
     total: Mapped[int] = mapped_column(Integer, default=0)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow, index=True)
+    paused: Mapped[bool] = mapped_column(Boolean, default=False)
 
 
 class Rule(Base):
@@ -136,6 +137,7 @@ async def init_db() -> None:
         await conn.execute(text("CREATE INDEX IF NOT EXISTS ix_scans_batch_id ON scans (batch_id)"))
         await conn.execute(text("ALTER TABLE scans ADD COLUMN IF NOT EXISTS started_at TIMESTAMPTZ"))
         await conn.execute(text("ALTER TABLE scans ADD COLUMN IF NOT EXISTS max_pages INTEGER"))
+        await conn.execute(text("ALTER TABLE batches ADD COLUMN IF NOT EXISTS paused BOOLEAN NOT NULL DEFAULT FALSE"))
     # Добавляем новые правила из кода, не трогая отредактированные в админке
     async with SessionLocal() as db:
         existing = set((await db.execute(select(Rule.id))).scalars())

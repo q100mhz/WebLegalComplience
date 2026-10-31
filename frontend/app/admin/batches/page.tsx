@@ -77,7 +77,7 @@ export default function Batches() {
                   <td><Link href={`/admin/batches/${b.id}`}>{b.name}</Link></td>
                   <td style={{ minWidth: 180 }}>
                     <div className="bar slim"><div style={{ width: `${(b.finished / Math.max(b.total, 1)) * 100}%` }} /></div>
-                    <span className="meta">{b.finished} из {b.total}{b.state === "running" ? ` · осталось ${fmtEta(b.eta_minutes) || "…"}` : " · завершён"}</span>
+                    <span className="meta">{b.finished} из {b.total}{b.state === "running" ? ` · осталось ${fmtEta(b.eta_minutes) || "…"}` : b.state === "paused" ? " · на паузе" : " · завершён"}</span>
                   </td>
                   <td>{b.counts.done || 0} / <span className={b.counts.failed ? "txt-bad" : ""}>{b.counts.failed || 0}</span></td>
                   <td>{b.avg_score ?? "—"}</td>

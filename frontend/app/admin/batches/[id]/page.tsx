@@ -12,10 +12,12 @@ interface Row {
 
 export default function BatchDetail({ params }: { params: Promise<{ id: string }> }) {
   const { id } = use(params);
-  const [b, setB] = useState<(BatchView & { scans: Row[] }) | null>(null);
+  const [b, setB] = useState<(BatchView & { scans: Row[]; urls_text: string }) | null>(null);
+  const [busy, setBusy] = useState(false);
+  const [copied, setCopied] = useState(false);
   const [filter, setFilter] = useState("");
 
-  const load = () => adminFetch<BatchView & { scans: Row[] }>(`/batches/${id}`).then(setB).catch(() => {});
+  const load = () => adminFetch<BatchView & { scans: Row[]; urls_text: string }>(`/batches/${id}`).then(setB).catch(() => {});
   useEffect(() => {
     load();
     const t = setInterval(load, 8000);
@@ -24,11 +26,25 @@ export default function BatchDetail({ params }: { params: Promise<{ id: string }
 
   if (!b) return <div className="spinner" />;
 
-  async function cancel() {
-    if (!confirm("Отменить проверку сайтов, которые ещё не начались?")) return;
-    await adminFetch(`/batches/${id}/cancel`, { method: "POST" });
-    load();
+  async function act(path: string, confirmText?: string) {
+    if (confirmText && !confirm(confirmText)) return;
+    setBusy(true);
+    try {
+      const r = await adminFetch<{ id?: string }>(`/batches/${id}/${path}`, { method: "POST" });
+      if (r.id && r.id !== id) location.href = `/admin/batches/${r.id}`; // «начать заново» — новый пакет
+      else load();
+    } finally {
+      setBusy(false);
+    }
   }
+
+  async function copy() {
+    await navigator.clipboard.writeText(b!.urls_text);
+    setCopied(true);
+    setTimeout(() => setCopied(false), 2000);
+  }
+
+  const retryable = (b.counts.failed || 0) + (b.counts.cancelled || 0);
 
   const rows = filter ? b.scans.filter((s) => s.status === filter) : b.scans;
   const statuses = Object.entries(b.counts);
@@ -42,16 +58,48 @@ export default function BatchDetail({ params }: { params: Promise<{ id: string }
         <div className="row">
           <span>
             Проверено {b.finished} из {b.total}
-            {b.state === "running" ? ` · осталось ${fmtEta(b.eta_minutes) || "оценка появится после первых сайтов"}` : " · пакет завершён"}
+            {b.state === "running" ? ` · осталось ${fmtEta(b.eta_minutes) || "оценка появится после первых сайтов"}`
+              : b.state === "paused" ? " · на паузе" : " · пакет завершён"}
             {b.avg_score != null && ` · средний балл ${b.avg_score}`}
           </span>
-          <span className="fb-actions" style={{ marginTop: 0 }}>
-            {b.state === "running" && <button className="link-btn" onClick={cancel}>Отменить оставшиеся</button>}
-            <a className="btn small" href={`/api/admin/export.zip?batch=${b.id}`}>Скачать архив для аудита</a>
-          </span>
+          <a className="btn small" href={`/api/admin/export.zip?batch=${b.id}`}>Скачать архив для аудита</a>
         </div>
-        {b.state === "running" && <p className="meta">Архив можно скачать и до завершения — в него попадут уже проверенные сайты.</p>}
+        <div className="fb-actions">
+          {b.state === "running" && (
+            <button className="btn secondary small" disabled={busy} onClick={() => act("pause")}>⏸ Пауза</button>
+          )}
+          {b.state === "paused" && (
+            <button className="btn small" disabled={busy} onClick={() => act("resume")}>▶ Продолжить</button>
+          )}
+          {retryable > 0 && (
+            <button className="btn secondary small" disabled={busy} onClick={() => act("retry-failed")}>
+              ↻ Повторить неудачные и отменённые ({retryable})
+            </button>
+          )}
+          <button className="btn secondary small" disabled={busy}
+            onClick={() => act("restart", "Запустить пакет заново? Будет создан новый пакет с тем же списком сайтов, текущий останется для сравнения.")}>
+            ⟲ Начать заново
+          </button>
+          {b.state !== "done" && (
+            <button className="link-btn" disabled={busy}
+              onClick={() => act("cancel", "Отменить проверку сайтов, которые ещё не начались?")}>Отменить оставшиеся</button>
+          )}
+        </div>
+        {b.state === "paused" && <p className="meta">Пакет на паузе: уже начатый сайт будет проверен до конца, следующие не начнутся, пока вы не нажмёте «Продолжить».</p>}
+        {b.state !== "done" && <p className="meta">Архив можно скачать и до завершения — в него попадут уже проверенные сайты.</p>}
       </div>
+
+      <details className="card">
+        <summary className="row" style={{ cursor: "pointer" }}>
+          <b>Список сайтов ({b.total})</b>
+          <span className="meta">скопировать и вставить в новую пакетную проверку</span>
+        </summary>
+        <textarea className="input mono" readOnly rows={Math.min(12, b.total + 1)} value={b.urls_text} style={{ marginTop: 10 }}
+          onFocus={(e) => e.target.select()} />
+        <div className="fb-actions">
+          <button className="btn small" onClick={copy}>{copied ? "Скопировано ✓" : "Скопировать список"}</button>
+        </div>
+      </details>
 
       <div className="filters">
         <button className={filter === "" ? "active" : ""} onClick={() => setFilter("")}>Все ({b.total})</button>

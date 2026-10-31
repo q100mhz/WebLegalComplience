@@ -12,7 +12,7 @@ from datetime import timedelta
 from redis.exceptions import LockError
 from sqlalchemy import func, select, update
 
-from .db import Scan, SessionLocal, utcnow
+from .db import Batch, Scan, SessionLocal, utcnow
 
 log = logging.getLogger(__name__)
 ACTIVE = ("queued", "running")
@@ -40,7 +40,9 @@ async def _pump(redis) -> str | None:
             if active:
                 return None
             nxt = (await db.execute(
-                select(Scan).where(Scan.status == "pending").order_by(Scan.created_at, Scan.id).limit(1)
+                select(Scan).join(Batch, Batch.id == Scan.batch_id)
+                .where(Scan.status == "pending", Batch.paused.is_(False))  # пакеты на паузе пропускаем
+                .order_by(Scan.created_at, Scan.id).limit(1)
             )).scalar_one_or_none()
             if not nxt:
                 return None

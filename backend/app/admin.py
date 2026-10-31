@@ -296,18 +296,18 @@ async def create_batch(body: BatchIn, request: Request):
 
 
 async def _batch_rows(db, ids: list[str]) -> dict[str, dict]:
+    duration = func.avg(func.extract("epoch", Scan.finished_at - Scan.started_at))
     rows = (await db.execute(
-        select(Scan.batch_id, Scan.status, func.count(), func.avg(Scan.score), func.max(Scan.finished_at))
+        select(Scan.batch_id, Scan.status, func.count(), func.avg(Scan.score), duration)
         .where(Scan.batch_id.in_(ids)).group_by(Scan.batch_id, Scan.status)
     )).all()
-    out: dict[str, dict] = {i: {"counts": {}, "avg_score": None, "last_finished": None} for i in ids}
-    for bid, st, n, avg, last in rows:
+    out: dict[str, dict] = {i: {"counts": {}, "avg_score": None, "avg_duration": None} for i in ids}
+    for bid, st, n, avg, dur in rows:
         o = out[bid]
         o["counts"][st] = n
-        if st == "done" and avg is not None:
-            o["avg_score"] = round(avg)
-        if last and (o["last_finished"] is None or last > o["last_finished"]):
-            o["last_finished"] = last
+        if st == "done":
+            o["avg_score"] = round(avg) if avg is not None else None
+            o["avg_duration"] = float(dur) if dur is not None else None
     return out
 
 
@@ -315,13 +315,10 @@ def _batch_view(b: Batch, agg: dict) -> dict:
     c = agg["counts"]
     finished = c.get("done", 0) + c.get("failed", 0) + c.get("cancelled", 0)
     left = c.get("pending", 0) + c.get("queued", 0) + c.get("running", 0)
-    eta = None
-    if left and finished and agg["last_finished"]:
-        per_site = (agg["last_finished"] - b.created_at).total_seconds() / max(finished - c.get("cancelled", 0), 1)
-        eta = round(per_site * left / 60)
+    eta = round(agg["avg_duration"] * left / 60) if left and agg["avg_duration"] else None
+    state = "done" if not left else "paused" if b.paused else "running"
     return {"id": b.id, "name": b.name, "total": b.total, "created_at": b.created_at.isoformat(), "counts": c,
-            "finished": finished, "left": left, "avg_score": agg["avg_score"], "eta_minutes": eta,
-            "state": "running" if left else "done"}
+            "finished": finished, "left": left, "avg_score": agg["avg_score"], "eta_minutes": eta, "state": state}
 
 
 @router.get("/batches", dependencies=[Depends(require_admin)])
@@ -340,7 +337,67 @@ async def batch_detail(batch_id: str):
             raise HTTPException(404, "Пакет не найден")
         agg = await _batch_rows(db, [b.id])
         scans = (await db.execute(select(Scan).where(Scan.batch_id == b.id).order_by(Scan.created_at, Scan.id))).scalars().all()
-    return {**_batch_view(b, agg[b.id]), "scans": [_scan_row(s) for s in scans]}
+    return {**_batch_view(b, agg[b.id]), "scans": [_scan_row(s) for s in scans],
+            # список в том же виде, в каком его вставляют при создании пакета
+            "urls_text": "\n".join(s.url for s in scans)}
+
+
+async def _get_batch(db, batch_id: str) -> Batch:
+    b = await db.get(Batch, batch_id)
+    if not b:
+        raise HTTPException(404, "Пакет не найден")
+    return b
+
+
+@router.post("/batches/{batch_id}/pause", dependencies=[Depends(require_admin)])
+async def pause_batch(batch_id: str):
+    """Пауза: текущий сайт доработает, следующие не начнутся."""
+    async with SessionLocal() as db:
+        b = await _get_batch(db, batch_id)
+        b.paused = True
+        # поставленный в очередь, но ещё не начатый сайт возвращаем в ожидание (его задание будет пропущено)
+        await db.execute(update(Scan).where(Scan.batch_id == batch_id, Scan.status == "queued").values(status="pending"))
+        await db.commit()
+    return {"ok": True}
+
+
+@router.post("/batches/{batch_id}/resume", dependencies=[Depends(require_admin)])
+async def resume_batch(batch_id: str, request: Request):
+    async with SessionLocal() as db:
+        b = await _get_batch(db, batch_id)
+        b.paused = False
+        await db.commit()
+    await batches.pump(request.app.state.redis)
+    return {"ok": True}
+
+
+@router.post("/batches/{batch_id}/retry-failed", dependencies=[Depends(require_admin)])
+async def retry_failed(batch_id: str, request: Request):
+    """Повторить сайты, которые не удалось проверить или которые были отменены."""
+    async with SessionLocal() as db:
+        b = await _get_batch(db, batch_id)
+        res = await db.execute(update(Scan).where(Scan.batch_id == batch_id, Scan.status.in_(("failed", "cancelled")))
+                               .values(status="pending", error=None, result=None, score=None, pages_scanned=0,
+                                       started_at=None, finished_at=None, current_url=None))
+        b.paused = False
+        await db.commit()
+    await batches.pump(request.app.state.redis)
+    return {"requeued": res.rowcount}
+
+
+@router.post("/batches/{batch_id}/restart", dependencies=[Depends(require_admin)])
+async def restart_batch(batch_id: str, request: Request):
+    """Начать заново: новый пакет с тем же списком. Прежний остаётся для сравнения «было/стало»;
+    его незавершённые сайты отменяются, чтобы не проверять их дважды."""
+    async with SessionLocal() as db:
+        b = await _get_batch(db, batch_id)
+        urls = (await db.execute(select(Scan.url).where(Scan.batch_id == batch_id)
+                                 .order_by(Scan.created_at, Scan.id))).scalars().all()
+        await db.execute(update(Scan).where(Scan.batch_id == batch_id, Scan.status.in_(("pending", "queued")))
+                         .values(status="cancelled", error="Пакет запущен заново", finished_at=utcnow()))
+        name = re.sub(r"\s+\(повтор.*\)$", "", b.name)
+        await db.commit()
+    return await create_batch(BatchIn(name=f"{name} (повтор от {utcnow():%d.%m %H:%M})", urls="\n".join(urls)), request)
 
 
 @router.post("/batches/{batch_id}/cancel", dependencies=[Depends(require_admin)])
