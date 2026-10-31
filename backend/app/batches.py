@@ -7,6 +7,7 @@
 
 import logging
 import time
+from datetime import timedelta
 
 from redis.exceptions import LockError
 from sqlalchemy import func, select, update
@@ -57,5 +58,13 @@ async def recover_after_restart(redis) -> None:
         await db.execute(update(Scan).where(Scan.status == "running").values(
             status="failed", error="Проверка прервана перезапуском сервиса", finished_at=utcnow()))
         await db.execute(update(Scan).where(Scan.batch_id.is_not(None), Scan.status == "queued").values(status="pending"))
+        # проверки посетителей: недавние — заново в очередь (задание могло потеряться), старые — закрываем
+        recent = utcnow() - timedelta(hours=2)
+        await db.execute(update(Scan).where(Scan.batch_id.is_(None), Scan.status == "queued", Scan.created_at < recent)
+                         .values(status="failed", error="Проверка прервана перезапуском сервиса", finished_at=utcnow()))
+        requeue = (await db.execute(select(Scan.id).where(Scan.batch_id.is_(None), Scan.status == "queued")
+                                    .order_by(Scan.created_at))).scalars().all()
         await db.commit()
+    for scan_id in requeue:  # повторный запуск безопасен: run_scan выполняет только проверки в статусе queued
+        await enqueue(redis, scan_id)
     await pump(redis)

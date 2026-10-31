@@ -19,7 +19,7 @@ from .checks.common import form_is_pd, form_signature
 from .fastfetch import PageGone, http_page
 from .services_db import match_service
 from .models import Checkbox, Form, FormInput, HttpsInfo, Link, PageData, SiteData
-from .urls import clean_link, is_same_site, resolve_public
+from .urls import clean_link, is_same_site, page_key, resolve_public, strip_tracking
 
 log = logging.getLogger(__name__)
 
@@ -271,7 +271,14 @@ async def _screenshot(coro, target, name: str) -> None:
         pass
 
 
-async def crawl(start_url: str, progress: ProgressCb | None = None, shots_dir: Path | None = None) -> SiteData:
+async def crawl(
+    start_url: str,
+    progress: ProgressCb | None = None,
+    shots_dir: Path | None = None,
+    on_quick: Callable[[SiteData], Awaitable[None]] | None = None,
+) -> SiteData:
+    """on_quick вызывается один раз, когда собраны главная и первые юридически значимые страницы
+    (settings.quick_pages страниц или settings.quick_seconds секунд) — для предварительного отчёта."""
     host = urlsplit(start_url).hostname or ""
     ok, ip = await resolve_public(host)
     if not ok:
@@ -363,6 +370,7 @@ async def crawl(start_url: str, progress: ProgressCb | None = None, shots_dir: P
 
             # 3. Обход внутренних страниц с приоритетом юридически значимых
             seen = {home.url.rstrip("/"), start_url.rstrip("/")}
+            seen_pages = {page_key(home.url), page_key(start_url)}
             queue: list[tuple[int, int, int, str]] = []
             counter = 0
 
@@ -372,6 +380,7 @@ async def crawl(start_url: str, progress: ProgressCb | None = None, shots_dir: P
                     u = clean_link(p.url, l.href)
                     if not u or not is_same_site(u, host):
                         continue
+                    u = strip_tracking(u)
                     key = u.rstrip("/")
                     if key in seen:
                         continue
@@ -385,10 +394,15 @@ async def crawl(start_url: str, progress: ProgressCb | None = None, shots_dir: P
                         continue
                     seen.add(key)
                     prio = 0 if PRIORITY_RE.search(path + " " + l.text) else depth
+                    pk = page_key(u)
+                    if pk in seen_pages:  # та же страница с другими параметрами — только если останется лимит
+                        prio = depth + 10
+                    seen_pages.add(pk)
                     counter += 1
                     heapq.heappush(queue, (prio, depth, counter, u))
 
             enqueue(home, 1)
+            quick_sent = False
             in_flight: dict[asyncio.Task, int] = {}
             while (queue or in_flight) and len(site.pages) < settings.max_pages:
                 limit = settings.parallel_tabs + (HTTP_PARALLEL if mode == "hybrid" else 0)
@@ -412,6 +426,11 @@ async def crawl(start_url: str, progress: ProgressCb | None = None, shots_dir: P
                     if progress:
                         await progress(len(site.pages), pd.url)
                     enqueue(pd, depth + 1)
+                    if on_quick and not quick_sent and (
+                        len(site.pages) >= settings.quick_pages or time.monotonic() - t0 >= settings.quick_seconds
+                    ):
+                        quick_sent = True
+                        await on_quick(site)
             for task in in_flight:
                 task.cancel()
             site.truncated = len(site.pages) >= settings.max_pages and bool(queue or in_flight)

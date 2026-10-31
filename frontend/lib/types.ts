@@ -41,8 +41,8 @@ export interface Profile {
 
 export interface Report {
   profile?: Profile;
-  score: number;
-  grade: "good" | "medium" | "bad";
+  score: number | null;
+  grade: "good" | "medium" | "bad" | null;
   counts: Record<Status, number>;
   final_url: string;
   pages: { url: string; title: string; status: number | null; screenshot?: string | null }[];
@@ -63,4 +63,6 @@ export interface Scan {
   finished_at: string | null;
   error: string | null;
   report: Report | null;
+  partial?: boolean;
+  eta_seconds?: number | null;
 }

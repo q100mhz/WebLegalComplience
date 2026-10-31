@@ -2,8 +2,9 @@
 
 import asyncio
 import ipaddress
+import re
 import socket
-from urllib.parse import urldefrag, urljoin, urlsplit, urlunsplit
+from urllib.parse import parse_qsl, urldefrag, urlencode, urljoin, urlsplit, urlunsplit
 
 
 class UrlError(ValueError):
@@ -81,3 +82,21 @@ async def resolve_public(host: str) -> tuple[bool, str | None]:
         _resolve_cache.clear()
     _resolve_cache[host] = res
     return res
+
+
+TRACKING_PARAM_RE = re.compile(r"^(utm_\w+|gclid|yclid|fbclid|_openstat|from|ref|referrer|moved_from|roistat\w*|_ga|_gl)$", re.I)
+
+
+def strip_tracking(url: str) -> str:
+    """Убирает из адреса метки рекламы и аналитики: это одна и та же страница."""
+    parts = urlsplit(url)
+    if not parts.query:
+        return url
+    query = [(k, v) for k, v in parse_qsl(parts.query, keep_blank_values=True) if not TRACKING_PARAM_RE.match(k)]
+    return urlunsplit((parts.scheme, parts.netloc, parts.path, urlencode(query), ""))
+
+
+def page_key(url: str) -> str:
+    """Адрес страницы без параметров — чтобы варианты одной страницы не съедали лимит обхода."""
+    p = urlsplit(url)
+    return f"{p.netloc.lower()}{p.path.rstrip('/')}"

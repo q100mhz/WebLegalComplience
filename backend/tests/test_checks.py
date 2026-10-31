@@ -253,3 +253,24 @@ def test_travel_not_detected_from_word_hotel_in_verbs():
     site = good_site()
     site.pages[0].text = "Мы хотели бы рассказать. Вы хотели узнать номер телефона? Тур-нир. " * 5
     assert not any(t["code"] == "travel" for t in build_profile(site)["types"])
+
+
+def test_partial_report_hides_score_and_absence_based_conclusions():
+    from app.scanner.report import partial_view
+    site = good_site()
+    site.pages = site.pages[:1]
+    site.pages[0].links = []  # политика ещё не найдена — в предварительном отчёте это не нарушение
+    site.initial_request_urls = ["https://www.google-analytics.com/g/collect"]
+    p = partial_view(build_report(site))
+    ids = {f["id"] for f in p["findings"]}
+    assert p["score"] is None and p["partial"]
+    assert "foreign_services" in ids  # найденный трекер — стабильный вывод
+    assert "privacy_policy" not in ids  # «не найдено» ждёт полной проверки
+    assert all(f["status"] in ("fail", "warn") for f in p["findings"])
+
+
+def test_tracking_params_and_page_variants():
+    from app.scanner.urls import page_key, strip_tracking
+    assert strip_tracking("https://x.ru/news/?utm_source=vk&moved_from=RU") == "https://x.ru/news/"
+    assert strip_tracking("https://x.ru/catalog/?page=2&utm_medium=cpc") == "https://x.ru/catalog/?page=2"
+    assert page_key("https://x.ru/news/?page=2") == page_key("https://x.ru/news")

@@ -9,6 +9,7 @@ from fastapi import FastAPI, HTTPException, Request
 from pydantic import BaseModel, Field
 from sqlalchemy import select
 
+from . import runtime
 from .admin import router as admin_router
 from .admin import rules_map
 from .config import settings
@@ -63,7 +64,9 @@ def public_view(scan: Scan, rules: dict[str, dict] | None = None) -> dict:
         "error": scan.error,
         "report": None,
     }
-    if scan.result and scan.status == "done":
+    partial = scan.status == "running" and bool((scan.result or {}).get("partial"))
+    data["partial"] = partial
+    if scan.result and (scan.status == "done" or partial):
         r = copy.deepcopy(scan.result)
         rules = rules or {}
         r["findings"] = [
@@ -134,7 +137,9 @@ async def get_scan(scan_id: str):
         scan = await db.get(Scan, scan_id)
     if not scan:
         raise HTTPException(404, "Проверка не найдена")
-    return public_view(scan, await rules_map())
+    data = public_view(scan, await rules_map())
+    data["eta_seconds"] = await runtime.eta_seconds(scan)
+    return data
 
 
 class FeedbackIn(BaseModel):

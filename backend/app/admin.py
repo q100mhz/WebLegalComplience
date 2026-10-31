@@ -17,7 +17,7 @@ from fastapi.responses import FileResponse, StreamingResponse
 from pydantic import BaseModel
 from sqlalchemy import Date, cast, func, or_, select, text, update
 
-from . import batches, rkn
+from . import batches, rkn, runtime
 from .config import settings, shots_dir
 from .db import Batch, Feedback, RknCheck, Rule, Scan, SessionLocal, kv_get, utcnow
 from .scanner.urls import UrlError, normalize_input, site_key
@@ -139,6 +139,58 @@ async def stats():
         "site_types": [{"name": t, "count": c} for t, c in types],
         "platforms": [{"name": p, "count": c} for p, c in platforms],
         "rkn": rkn_meta,
+    }
+
+
+# ---------- Нагрузка и одновременные проверки ----------
+
+class ConcurrencyIn(BaseModel):
+    scan_concurrency: int
+
+
+@router.get("/settings", dependencies=[Depends(require_admin)])
+async def get_runtime_settings():
+    return {**(await runtime.get_settings()), **runtime.server_resources(), "max": settings.max_concurrency}
+
+
+@router.put("/settings", dependencies=[Depends(require_admin)])
+async def put_runtime_settings(body: ConcurrencyIn):
+    if not 1 <= body.scan_concurrency <= settings.max_concurrency:
+        raise HTTPException(422, f"Допустимо от 1 до {settings.max_concurrency}")
+    return {**(await runtime.set_concurrency(body.scan_concurrency)), **runtime.server_resources(),
+            "max": settings.max_concurrency}
+
+
+LOAD_RANGES = {6: (300, 30), 24: (900, 60), 168: (7200, 600)}  # часы → (размер столбца, шаг выборки), сек
+
+
+@router.get("/load", dependencies=[Depends(require_admin)])
+async def load(hours: int = 24):
+    """Нагрузка в динамике: сколько проверок выполнялось одновременно и сколько посетителей ждали старта.
+    Считается по времени создания, старта и завершения каждой проверки."""
+    hours = min(LOAD_RANGES, key=lambda h: abs(h - hours))
+    bucket_s, step_s = LOAD_RANGES[hours]
+    now = utcnow()
+    since = now - timedelta(hours=hours)
+    async with SessionLocal() as db:
+        rows = (await db.execute(
+            select(Scan.created_at, Scan.started_at, Scan.finished_at, Scan.status, Scan.batch_id)
+            .where(or_(Scan.created_at >= since - timedelta(hours=2), Scan.status.in_(("queued", "running"))))
+        )).all()
+    scans = [runtime.LoadScan(c, st, f, status, b is not None) for c, st, f, status, b in rows]
+    out = runtime.load_series(scans, now, hours * 3600, bucket_s, step_s)
+    async with SessionLocal() as db:
+        running_now = (await db.execute(select(func.count()).select_from(Scan).where(Scan.status == "running"))).scalar_one()
+        waiting_now = (await db.execute(select(func.count()).select_from(Scan).where(
+            Scan.status == "queued", Scan.batch_id.is_(None)))).scalar_one()
+        pending_batch = (await db.execute(select(func.count()).select_from(Scan).where(Scan.status == "pending"))).scalar_one()
+    limit = (await runtime.get_settings())["scan_concurrency"]
+    peaks = sorted((x for x in out if x["max_waiting"] or x["max_running"] > 1),
+                   key=lambda x: (-x["max_waiting"], -(x["max_wait_s"] or 0)))[:5]
+    return {
+        "hours": hours, "bucket_s": bucket_s, "series": out, "peaks": peaks,
+        "now": {"running": running_now, "waiting": waiting_now, "pending_batch": pending_batch, "limit": limit,
+                "avg_duration_s": round(await runtime.avg_duration())},
     }
 
 

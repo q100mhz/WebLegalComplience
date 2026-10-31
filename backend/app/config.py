@@ -18,7 +18,10 @@ class Settings(BaseSettings):
     fast_fetch: bool = True  # внутренние страницы без JavaScript грузить HTTP-запросом
     rate_limit_per_hour: int = 10
     dedup_minutes: int = 15
-    worker_concurrency: int = 2
+    worker_concurrency: int = 2  # начальное число одновременных проверок; дальше меняется в админке
+    max_concurrency: int = 6  # верхняя граница для настройки в админке
+    quick_pages: int = 10  # предварительный отчёт: после стольких страниц…
+    quick_seconds: int = 25  # …или через столько секунд — что наступит раньше
 
     data_dir: str = "/data"  # скриншоты-доказательства
     screenshots_keep_days: int = 90

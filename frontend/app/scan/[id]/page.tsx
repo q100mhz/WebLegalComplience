@@ -46,25 +46,31 @@ export default function ScanPage({ params }: { params: Promise<{ id: string }> }
   if (scan.status === "cancelled") return <Message title={`Проверка ${scan.host} отменена`} text="Проверка была отменена администратором." />;
   if (scan.status === "failed")
     return <Message title={`Не удалось проверить ${scan.host}`} text={scan.error || "Неизвестная ошибка"} />;
-  if (scan.status !== "done" || !scan.report) {
-    const pct = Math.max(4, Math.round((scan.pages_scanned / scan.max_pages) * 100));
+  if (!scan.report) {
+    // ждём старта или первых страниц: посетителю — только сколько осталось
+    const pct = scan.status === "running" ? Math.max(4, Math.round((scan.pages_scanned / scan.max_pages) * 100)) : 2;
     return (
       <div className="container">
         <div className="progress-box">
           <div className="spinner" />
-          <h2>{scan.status === "running" ? `Сканируем ${scan.host}` : "Проверка в очереди…"}</h2>
+          <h2>Проверяем {scan.host}</h2>
           <div className="bar">
-            <div style={{ width: `${scan.status === "running" ? pct : 2}%` }} />
+            <div style={{ width: `${pct}%` }} />
           </div>
-          <div className="meta">
-            Проанализировано страниц: {scan.pages_scanned} из {scan.max_pages}
-          </div>
-          {scan.current_url && <div className="current">{scan.current_url}</div>}
+          <div className="meta">{etaText(scan.eta_seconds)}</div>
+          {scan.status === "running" && scan.current_url && <div className="current">{scan.current_url}</div>}
+          <p className="hint">Первые результаты появятся примерно через 30 секунд после начала проверки.</p>
         </div>
       </div>
     );
   }
   return <ReportView scan={scan} />;
+}
+
+function etaText(sec: number | null | undefined): string {
+  if (sec == null) return "Подготовка проверки…";
+  if (sec < 60) return "Осталось меньше минуты";
+  return `Осталось примерно ${Math.ceil(sec / 60)} мин`;
 }
 
 function ReportView({ scan }: { scan: Scan }) {
@@ -78,22 +84,39 @@ function ReportView({ scan }: { scan: Scan }) {
 
   return (
     <div className="container">
-      <div className="report-head">
-        <div className={`score ${r.grade}`}>
+      {scan.partial && (
+        <div className="partial-banner">
+          <div className="spinner small" />
           <div>
-            {r.score}
-            <small>из 100</small>
+            <b>Первые результаты</b> — проверены главная и ключевые страницы ({r.pages.length}). Ниже — проблемы,
+            которые уже найдены. Проверка остальных страниц продолжается, оценка и полный отчёт появятся автоматически.{" "}
+            {etaText(scan.eta_seconds)}.
+            <div className="bar slim"><div style={{ width: `${Math.max(4, Math.round((scan.pages_scanned / scan.max_pages) * 100))}%` }} /></div>
           </div>
         </div>
+      )}
+      <div className="report-head">
+        {scan.partial || r.score == null ? (
+          <div className="score pending"><div className="spinner small light" /></div>
+        ) : (
+          <div className={`score ${r.grade}`}>
+            <div>
+              {r.score}
+              <small>из 100</small>
+            </div>
+          </div>
+        )}
         <div>
           <h1>{scan.host}</h1>
           <div className="meta">
-            {GRADE_LABEL[r.grade]} · проверено страниц: {r.pages.length} · {finished}
+            {scan.partial
+              ? `Идёт проверка · проверено страниц: ${scan.pages_scanned} из ${scan.max_pages}`
+              : `${GRADE_LABEL[r.grade!]} · проверено страниц: ${r.pages.length} · ${finished}`}
           </div>
           <div className="counts">
-            {(["fail", "warn", "info", "pass"] as Status[]).map((s) => (
+            {((scan.partial ? ["fail", "warn"] : ["fail", "warn", "info", "pass"]) as Status[]).map((s) => (
               <span key={s} className={`pill ${s}`}>
-                {STATUS_LABEL[s]}: {r.counts[s] ?? 0}
+                {STATUS_LABEL[s]}: {r.counts[s] ?? 0}{scan.partial ? " пока" : ""}
               </span>
             ))}
           </div>
@@ -119,6 +142,7 @@ function ReportView({ scan }: { scan: Scan }) {
       {items.map((f) => (
         <FindingCard key={f.id} f={f} scanId={scan.id} />
       ))}
+      {scan.partial && !items.length && <p className="meta">Пока проблем не найдено — проверка продолжается.</p>}
 
       <div className="cta">
         <div>

@@ -2,6 +2,7 @@
 
 import Link from "next/link";
 import { useEffect, useState } from "react";
+import LoadPanel from "@/components/LoadPanel";
 import { adminFetch, fmtDate } from "@/lib/admin";
 
 interface Stats {
@@ -56,6 +57,8 @@ export default function Dashboard() {
           </div>
         ))}
       </div>
+
+      <LoadPanel />
 
       <div className="card">
         <h3>Проверки по дням (30 дней)</h3>

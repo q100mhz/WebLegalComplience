@@ -71,3 +71,20 @@ def build_report(site: SiteData) -> dict:
         "findings": [f.to_dict() for f in findings],
         "disclaimer": DISCLAIMER,
     }
+
+
+# Предварительный отчёт строится по первым страницам. Показываем только проблемы, найденные по факту
+# присутствия (трекер загрузился, форма без согласия, ссылка на Instagram): дальнейшая проверка их не отменит.
+# Выводы «не найдено» (политика, реквизиты, знак 0+, лицензия…) ждут полной проверки — нужное может найтись
+# на следующих страницах. По той же причине в предварительном отчёте нет балла.
+PARTIAL_STABLE = {
+    "cookies", "foreign_services", "foreign_resources", "foreign_platform", "hosting", "https", "foreign_auth",
+    "meta_links", "forms_consent", "newsletter_consent", "policy_on_form_pages", "special_categories",
+    "payment_cards", "inn_valid", "rkn_registry", "language", "restricted_goods",
+}
+
+
+def partial_view(report: dict) -> dict:
+    findings = [f for f in report["findings"] if f["id"] in PARTIAL_STABLE and f["status"] in ("fail", "warn")]
+    counts = {s: sum(1 for f in findings if f["status"] == s) for s in ORDER}
+    return {**report, "findings": findings, "counts": counts, "score": None, "grade": None, "partial": True}
