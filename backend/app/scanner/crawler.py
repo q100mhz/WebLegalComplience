@@ -276,9 +276,12 @@ async def crawl(
     progress: ProgressCb | None = None,
     shots_dir: Path | None = None,
     on_quick: Callable[[SiteData], Awaitable[None]] | None = None,
+    max_pages: int | None = None,
 ) -> SiteData:
     """on_quick вызывается один раз, когда собраны главная и первые юридически значимые страницы
     (settings.quick_pages страниц или settings.quick_seconds секунд) — для предварительного отчёта."""
+    max_pages = max_pages or settings.max_pages
+    max_depth = settings.max_depth + (2 if max_pages > 100 else 0)  # глубокой проверке — больше уровней ссылок
     host = urlsplit(start_url).hostname or ""
     ok, ip = await resolve_public(host)
     if not ok:
@@ -404,11 +407,11 @@ async def crawl(
             enqueue(home, 1)
             quick_sent = False
             in_flight: dict[asyncio.Task, int] = {}
-            while (queue or in_flight) and len(site.pages) < settings.max_pages:
+            while (queue or in_flight) and len(site.pages) < max_pages:
                 limit = settings.parallel_tabs + (HTTP_PARALLEL if mode == "hybrid" else 0)
-                while queue and len(in_flight) < limit and len(site.pages) + len(in_flight) < settings.max_pages:
+                while queue and len(in_flight) < limit and len(site.pages) + len(in_flight) < max_pages:
                     _, depth, _, url = heapq.heappop(queue)
-                    if depth <= settings.max_depth:
+                    if depth <= max_depth:
                         in_flight[asyncio.create_task(fetch(url))] = depth
                 if not in_flight:
                     break
@@ -420,7 +423,7 @@ async def crawl(
                     except RuntimeError as e:
                         site.errors.append(str(e))
                         continue
-                    if not is_same_site(pd.url, host) or len(site.pages) >= settings.max_pages:
+                    if not is_same_site(pd.url, host) or len(site.pages) >= max_pages:
                         continue
                     site.pages.append(pd)
                     if progress:
@@ -433,7 +436,7 @@ async def crawl(
                         await on_quick(site)
             for task in in_flight:
                 task.cancel()
-            site.truncated = len(site.pages) >= settings.max_pages and bool(queue or in_flight)
+            site.truncated = len(site.pages) >= max_pages and bool(queue or in_flight)
             await http.aclose()
             inner = time.monotonic() - t_home - site.timing["home_s"]
             site.timing.update(

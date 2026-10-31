@@ -57,7 +57,7 @@ def public_view(scan: Scan, rules: dict[str, dict] | None = None) -> dict:
         "host": scan.host,
         "status": scan.status,
         "pages_scanned": scan.pages_scanned,
-        "max_pages": settings.max_pages,
+        "max_pages": scan.max_pages or settings.max_pages,
         "current_url": scan.current_url,
         "created_at": scan.created_at.isoformat(),
         "finished_at": scan.finished_at.isoformat() if scan.finished_at else None,

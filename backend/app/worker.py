@@ -10,7 +10,7 @@ from arq.connections import RedisSettings
 from sqlalchemy import update
 
 from . import batches, rkn, runtime
-from .config import settings, shots_dir
+from .config import scan_timeout, settings, shots_dir
 from .db import Scan, SessionLocal, utcnow
 from .scanner import snapshot
 from .scanner.checks.pdn import find_inns
@@ -73,7 +73,7 @@ async def run_scan(ctx, scan_id: str) -> None:
         return
     await gate.acquire()
     try:
-        if await _claim(scan.id):
+        if await _claim(scan):
             await _scan(ctx, scan)
     finally:
         await gate.release()
@@ -81,12 +81,15 @@ async def run_scan(ctx, scan_id: str) -> None:
             await batches.pump(ctx["redis"])
 
 
-async def _claim(scan_id: str) -> bool:
-    """queued → running атомарно: одну проверку выполняет только одно задание."""
+async def _claim(scan: Scan) -> bool:
+    """queued → running атомарно: одну проверку выполняет только одно задание.
+    Глубина фиксируется в проверке — смена настройки в админке не влияет на уже идущие."""
+    max_pages = (await runtime.get_settings())["max_pages"]
     async with SessionLocal() as db:
-        res = await db.execute(update(Scan).where(Scan.id == scan_id, Scan.status == "queued")
-                               .values(status="running", started_at=utcnow()))
+        res = await db.execute(update(Scan).where(Scan.id == scan.id, Scan.status == "queued")
+                               .values(status="running", started_at=utcnow(), max_pages=max_pages))
         await db.commit()
+    scan.max_pages = max_pages
     return res.rowcount == 1
 
 
@@ -113,8 +116,8 @@ async def _scan(ctx, scan: Scan) -> None:
             log.exception("quick report failed for %s", scan_id)
 
     try:
-        site = await asyncio.wait_for(crawl(scan.url, progress, shots_dir(scan_id), on_quick),
-                                      timeout=settings.scan_timeout_s)
+        site = await asyncio.wait_for(crawl(scan.url, progress, shots_dir(scan_id), on_quick, scan.max_pages),
+                                      timeout=scan_timeout(scan.max_pages))
         site.profile["rkn"] = await rkn.lookup(find_inns(site))
         try:  # снимок до построения отчёта: в профиле только данные РКН, остальное пересчитывается
             snapshot.save(site, shots_dir(scan_id))
@@ -173,5 +176,5 @@ class WorkerSettings:
     redis_settings = RedisSettings.from_dsn(settings.redis_url)
     # Берём задания с запасом: реальное число одновременных проверок ограничивает Gate (настройка в админке)
     max_jobs = settings.max_concurrency + 4
-    job_timeout = 3 * 3600  # включает ожидание своей очереди в Gate; сама проверка ограничена scan_timeout_s
+    job_timeout = 6 * 3600  # включает ожидание своей очереди в Gate; сама проверка ограничена scan_timeout()
     max_tries = 1

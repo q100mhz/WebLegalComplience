@@ -10,10 +10,12 @@ class Settings(BaseSettings):
     redis_url: str = "redis://localhost:6379/0"
 
     # Лимиты открытой версии
-    max_pages: int = 50
+    max_pages: int = 50  # глубина по умолчанию; дальше меняется в админке
+    min_pages_limit: int = 5
+    max_pages_limit: int = 500
     max_depth: int = 4
     page_timeout_ms: int = 15000
-    scan_timeout_s: int = 420
+    scan_timeout_s: int = 420  # минимум; для глубоких проверок растёт — см. scan_timeout()
     parallel_tabs: int = 3  # вкладок браузера на одну проверку; ~1 на ядро CPU
     fast_fetch: bool = True  # внутренние страницы без JavaScript грузить HTTP-запросом
     rate_limit_per_hour: int = 10
@@ -44,3 +46,8 @@ settings = Settings()
 
 def shots_dir(scan_id: str) -> Path:
     return Path(settings.data_dir) / "shots" / scan_id
+
+
+def scan_timeout(max_pages: int) -> int:
+    """Таймаут проверки: главная + ~6 с на страницу в худшем случае (сайт целиком на JavaScript)."""
+    return max(settings.scan_timeout_s, 120 + max_pages * 6)

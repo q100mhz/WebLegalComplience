@@ -144,21 +144,29 @@ async def stats():
 
 # ---------- Нагрузка и одновременные проверки ----------
 
-class ConcurrencyIn(BaseModel):
-    scan_concurrency: int
+class RuntimeIn(BaseModel):
+    scan_concurrency: int | None = None
+    max_pages: int | None = None
+
+
+def _runtime_view(cfg: dict) -> dict:
+    return {**cfg, **runtime.server_resources(), "max": settings.max_concurrency,
+            "pages_min": settings.min_pages_limit, "pages_max": settings.max_pages_limit,
+            "pages_default": settings.max_pages}
 
 
 @router.get("/settings", dependencies=[Depends(require_admin)])
 async def get_runtime_settings():
-    return {**(await runtime.get_settings()), **runtime.server_resources(), "max": settings.max_concurrency}
+    return _runtime_view(await runtime.get_settings())
 
 
 @router.put("/settings", dependencies=[Depends(require_admin)])
-async def put_runtime_settings(body: ConcurrencyIn):
-    if not 1 <= body.scan_concurrency <= settings.max_concurrency:
-        raise HTTPException(422, f"Допустимо от 1 до {settings.max_concurrency}")
-    return {**(await runtime.set_concurrency(body.scan_concurrency)), **runtime.server_resources(),
-            "max": settings.max_concurrency}
+async def put_runtime_settings(body: RuntimeIn):
+    if body.scan_concurrency is not None and not 1 <= body.scan_concurrency <= settings.max_concurrency:
+        raise HTTPException(422, f"Одновременных проверок — от 1 до {settings.max_concurrency}")
+    if body.max_pages is not None and not settings.min_pages_limit <= body.max_pages <= settings.max_pages_limit:
+        raise HTTPException(422, f"Глубина проверки — от {settings.min_pages_limit} до {settings.max_pages_limit} страниц")
+    return _runtime_view(await runtime.update_settings(body.scan_concurrency, body.max_pages))
 
 
 LOAD_RANGES = {6: (300, 30), 24: (900, 60), 168: (7200, 600)}  # часы → (размер столбца, шаг выборки), сек

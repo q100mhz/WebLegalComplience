@@ -34,14 +34,21 @@ def server_resources() -> dict:
 async def get_settings() -> dict:
     async with SessionLocal() as db:
         data = await kv_get(db, KEY)
-    return {"scan_concurrency": int(data.get("scan_concurrency", settings.worker_concurrency))}
+    return {
+        "scan_concurrency": int(data.get("scan_concurrency", settings.worker_concurrency)),
+        "max_pages": int(data.get("max_pages", settings.max_pages)),
+    }
 
 
-async def set_concurrency(n: int) -> dict:
-    n = max(1, min(int(n), settings.max_concurrency))
+async def update_settings(scan_concurrency: int | None = None, max_pages: int | None = None) -> dict:
+    changes = {}
+    if scan_concurrency is not None:
+        changes["scan_concurrency"] = max(1, min(int(scan_concurrency), settings.max_concurrency))
+    if max_pages is not None:
+        changes["max_pages"] = max(settings.min_pages_limit, min(int(max_pages), settings.max_pages_limit))
     async with SessionLocal() as db:
         data = await kv_get(db, KEY)
-        await kv_set(db, KEY, {**data, "scan_concurrency": n})
+        await kv_set(db, KEY, {**data, **changes})
         await db.commit()
     return await get_settings()
 
@@ -75,12 +82,15 @@ async def eta_seconds(scan: Scan) -> int | None:
     if scan.status == "running":
         elapsed = (now - (scan.started_at or now)).total_seconds()
         if scan.pages_scanned >= 3:
-            total = elapsed / scan.pages_scanned * settings.max_pages
+            total = elapsed / scan.pages_scanned * (scan.max_pages or settings.max_pages)
             remaining = min(total, avg * 2) - elapsed
         else:
             remaining = avg - elapsed
         return int(max(remaining, 10))
-    limit = (await get_settings())["scan_concurrency"]
+    cfg = await get_settings()
+    limit = cfg["scan_concurrency"]
+    # длительность прошлых проверок пересчитываем на текущую глубину
+    avg = avg * cfg["max_pages"] / max(settings.max_pages, 1) if cfg["max_pages"] != settings.max_pages else avg
     async with SessionLocal() as db:
         ahead = (await db.execute(select(func.count()).select_from(Scan).where(
             Scan.status == "queued", Scan.created_at < scan.created_at,

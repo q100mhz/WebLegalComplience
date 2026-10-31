@@ -274,3 +274,9 @@ def test_tracking_params_and_page_variants():
     assert strip_tracking("https://x.ru/news/?utm_source=vk&moved_from=RU") == "https://x.ru/news/"
     assert strip_tracking("https://x.ru/catalog/?page=2&utm_medium=cpc") == "https://x.ru/catalog/?page=2"
     assert page_key("https://x.ru/news/?page=2") == page_key("https://x.ru/news")
+
+
+def test_scan_timeout_grows_with_depth():
+    from app.config import scan_timeout, settings
+    assert scan_timeout(10) == settings.scan_timeout_s  # не меньше базового
+    assert scan_timeout(300) > scan_timeout(50) >= settings.scan_timeout_s

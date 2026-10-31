@@ -38,6 +38,7 @@ class Scan(Base):
     finished_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     batch_id: Mapped[str | None] = mapped_column(String(36), nullable=True, index=True)
     started_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    max_pages: Mapped[int | None] = mapped_column(Integer, nullable=True)  # глубина на момент старта
 
 
 class Batch(Base):
@@ -134,6 +135,7 @@ async def init_db() -> None:
         await conn.execute(text("ALTER TABLE scans ADD COLUMN IF NOT EXISTS batch_id VARCHAR(36)"))
         await conn.execute(text("CREATE INDEX IF NOT EXISTS ix_scans_batch_id ON scans (batch_id)"))
         await conn.execute(text("ALTER TABLE scans ADD COLUMN IF NOT EXISTS started_at TIMESTAMPTZ"))
+        await conn.execute(text("ALTER TABLE scans ADD COLUMN IF NOT EXISTS max_pages INTEGER"))
     # Добавляем новые правила из кода, не трогая отредактированные в админке
     async with SessionLocal() as db:
         existing = set((await db.execute(select(Rule.id))).scalars())
