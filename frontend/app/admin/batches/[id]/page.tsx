@@ -62,7 +62,12 @@ export default function BatchDetail({ params }: { params: Promise<{ id: string }
               : b.state === "paused" ? " · на паузе" : " · пакет завершён"}
             {b.avg_score != null && ` · средний балл ${b.avg_score}`}
           </span>
-          <a className="btn small" href={`/api/admin/export.zip?batch=${b.id}`}>Скачать архив для аудита</a>
+          <span className="fb-actions" style={{ marginTop: 0 }}>
+            <a className="btn secondary small" href={`/api/admin/batches/${b.id}/documents.zip`} title="Политика, согласие, чекбоксы, cookie-баннер — папка на каждый сайт">
+              Документы всех сайтов (ZIP)
+            </a>
+            <a className="btn small" href={`/api/admin/export.zip?batch=${b.id}`}>Архив для аудита</a>
+          </span>
         </div>
         <div className="fb-actions">
           {b.state === "running" && (

@@ -9,7 +9,7 @@ from collections import Counter
 
 from .checks.common import all_text, field_label, form_is_pd, form_signature, input_is_pd, is_service_form
 from .models import Form, SiteData
-from .services_db import match_service
+from .services_db import match_service, match_tracking_cookie
 
 # Тип сайта: (название, регулярка, минимум разных совпадений)
 SITE_TYPES: dict[str, tuple[str, str, int]] = {
@@ -210,5 +210,68 @@ def build_profile(site: SiteData) -> dict:
         "forms": forms[:40],
         "restricted": restricted,
         "pages_count": len(site.pages),
+        "owner": extract_owner(site),
+        "services": _services(site),
+        "tracking_cookies": sorted({c["name"] for c in site.initial_cookies if match_tracking_cookie(c["name"])}),
     }
 
+
+
+def _services(site: SiteData) -> list[dict]:
+    found = {}
+    for u in site.all_request_urls():
+        sv = match_service(u)
+        if sv:
+            found[sv.name] = {"name": sv.name, "category": sv.category, "foreign": sv.foreign}
+    return sorted(found.values(), key=lambda x: (not x["foreign"], x["category"], x["name"]))
+
+
+ORG_RE = re.compile(
+    r"((?:ООО|АО|ПАО|ЗАО|НАО|ОАО|АНО|Общество\s+с\s+ограниченной\s+ответственностью|Акционерное\s+общество)"
+    r"\s*[«\"“„]\s*[^»\"”\n]{2,80}?[»\"”])"
+    r"|((?:ИП|Индивидуальный\s+предприниматель)\s+[А-ЯЁ][а-яё]+(?:\s+[А-ЯЁ](?:[а-яё]+|\.)){1,2}\.?)",
+)
+ADDRESS_RE = re.compile(r"(?:юридический\s+адрес|адрес(?:\s+организации)?|местонахождени[ея])\s*[:—-]\s*([^\n]{10,160})", re.I)
+PHONE_RE = re.compile(r"(?:\+7|8)[\s(-]*\d{3}[\s)-]*\d{3}[\s-]?\d{2}[\s-]?\d{2}")
+
+
+ADDRESS_END_RE = re.compile(r"\s(?:в\s+порядке|в\s+соответствии|тел[.:\s]|телефон|e-?mail|эл\.|почт|ИНН|ОГРН|КПП|режим|"
+                            r"пн|понедельник|ежедневно|график)", re.I)
+
+
+def _clean_address(raw: str) -> str:
+    """Адрес до первого постороннего фрагмента («в порядке…», «тел.», «ИНН»…)."""
+    m = ADDRESS_END_RE.search(raw)
+    return (raw[:m.start()] if m else raw).strip(" .,;:—-")[:150]
+
+
+def extract_owner(site: SiteData) -> dict:
+    """Реквизиты владельца со страниц сайта — для документов. Ищем рядом с ИНН, затем в подвале главной."""
+    from .checks.common import EMAIL_RE, INN_RE, OGRN_RE
+
+    text = all_text(site)
+    inn = INN_RE.search(text)
+    windows = []
+    if inn:
+        windows.append(text[max(0, inn.start() - 600):inn.end() + 600])
+    if site.home:
+        windows.append(site.home.text[-3000:])
+    windows.append(text)
+
+    def first(rx, group=0):
+        for w in windows:
+            m = rx.search(w)
+            if m:
+                return next((g for g in m.groups() if g), m.group(0)) if m.groups() else m.group(group)
+        return ""
+
+    ogrn = OGRN_RE.search(text)
+    email = first(EMAIL_RE)
+    return {
+        "name": re.sub(r"\s+", " ", first(ORG_RE)).strip(),
+        "inn": inn.group(1) if inn else "",
+        "ogrn": ogrn.group(2) if ogrn else "",
+        "address": _clean_address(first(ADDRESS_RE)),
+        "email": email if not email.lower().endswith((".png", ".jpg", ".svg", ".webp")) else "",
+        "phone": re.sub(r"\s+", " ", first(PHONE_RE)).strip(),
+    }

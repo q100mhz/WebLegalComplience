@@ -2,7 +2,9 @@
 
 import Link from "next/link";
 import { use, useEffect, useMemo, useState } from "react";
+import DocumentsView from "@/components/DocumentsView";
 import FeedbackForm from "@/components/FeedbackForm";
+import HowTo from "@/components/HowTo";
 import ProfileView from "@/components/ProfileView";
 import { getScan } from "@/lib/api";
 import type { Finding, Scan, Status } from "@/lib/types";
@@ -144,10 +146,12 @@ function ReportView({ scan }: { scan: Scan }) {
       ))}
       {scan.partial && !items.length && <p className="meta">Пока проблем не найдено — проверка продолжается.</p>}
 
+      {!scan.partial && scan.status === "done" && <DocumentsView scanId={scan.id} />}
+
       <div className="cta">
         <div>
           <strong>Полный отчёт с перечнем всех страниц и доказательств</strong>
-          <p>Скоро: личный кабинет, PDF-отчёт, шаблоны документов и регулярный мониторинг сайта.</p>
+          <p>Скоро: личный кабинет, PDF-отчёт и регулярный мониторинг сайта с уведомлениями.</p>
         </div>
         <Link href="/" className="btn secondary">
           Проверить другой сайт
@@ -180,6 +184,7 @@ function FindingCard({ f, scanId }: { f: Finding; scanId: string }) {
             <dd>{f.recommendation}</dd>
           </>
         )}
+        <HowTo h={f.howto} />
         {f.penalty && (f.status === "fail" || f.status === "warn") && (
           <>
             <dt>Ответственность</dt>

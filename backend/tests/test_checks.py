@@ -280,3 +280,16 @@ def test_scan_timeout_grows_with_depth():
     from app.config import scan_timeout, settings
     assert scan_timeout(10) == settings.scan_timeout_s  # не меньше базового
     assert scan_timeout(300) > scan_timeout(50) >= settings.scan_timeout_s
+
+
+def test_owner_extraction():
+    from app.scanner.profile import extract_owner
+    site = good_site()
+    site.pages[0].text = ("Главная. Контакты: ООО «Ромашка», ИНН 7707083893, ОГРН 1027700132195. "
+                          "Юридический адрес: 117997, г. Москва, ул. Вавилова, д. 19\nТел.: +7 (495) 500-55-50, info@romashka.ru")
+    o = extract_owner(site)
+    assert o["name"] == "ООО «Ромашка»" and o["inn"] == "7707083893" and o["ogrn"] == "1027700132195"
+    assert o["address"].startswith("117997, г. Москва") and o["email"] == "info@romashka.ru"
+    assert o["phone"].startswith("+7 (495)")
+    site.pages[0].text = "ИП Иванов Иван Иванович, ИНН 500100732259"
+    assert extract_owner(site)["name"] == "ИП Иванов Иван Иванович"

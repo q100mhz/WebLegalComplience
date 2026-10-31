@@ -2,6 +2,8 @@
 
 import Link from "next/link";
 import { use, useEffect, useState } from "react";
+import DocumentsView from "@/components/DocumentsView";
+import HowTo from "@/components/HowTo";
 import ProfileView from "@/components/ProfileView";
 import { adminFetch, fmtDate, STATUS_RU } from "@/lib/admin";
 import type { Finding, Report } from "@/lib/types";
@@ -119,11 +121,14 @@ export default function ScanDetail({ params }: { params: Promise<{ id: string }>
               <dl className="body">
                 <dt>Норма</dt><dd>{f.law}</dd>
                 {f.recommendation && <><dt>Рекомендация</dt><dd>{f.recommendation}</dd></>}
+                <HowTo h={f.howto} />
                 {f.penalty && <><dt>Ответственность (на момент проверки)</dt><dd>{f.penalty}</dd></>}
                 {f.evidence.length > 0 && <><dt>Доказательства ({f.evidence.length})</dt><dd><ul>{f.evidence.map((e) => <li key={e}>{e}</li>)}</ul></dd></>}
               </dl>
             </details>
           ))}
+          {d.status === "done" && <DocumentsView scanId={d.id} />}
+
           <div className="card">
             <h3>Просканированные страницы ({r.pages.length})</h3>
             <ul className="plain">{r.pages.map((p) => <li key={p.url}><a href={p.url} target="_blank" rel="noreferrer">{p.url}</a> <span className="meta">{p.status}</span></li>)}</ul>

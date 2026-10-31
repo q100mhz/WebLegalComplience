@@ -5,7 +5,7 @@ from urllib.parse import urlsplit
 
 from arq import create_pool
 from arq.connections import RedisSettings
-from fastapi import FastAPI, HTTPException, Request
+from fastapi import FastAPI, HTTPException, Request, Response
 from pydantic import BaseModel, Field
 from sqlalchemy import select
 
@@ -13,6 +13,8 @@ from . import runtime
 from .admin import router as admin_router
 from .admin import rules_map
 from .config import settings
+from .documents import documents_for, to_docx, to_markdown
+from .documents.howto import howto
 from .db import Feedback, Scan, SessionLocal, init_db, utcnow
 from .registry import format_penalty
 from .scanner.urls import UrlError, normalize_input, resolve_public, site_key
@@ -69,6 +71,7 @@ def public_view(scan: Scan, rules: dict[str, dict] | None = None) -> dict:
     if scan.result and (scan.status == "done" or partial):
         r = copy.deepcopy(scan.result)
         rules = rules or {}
+        platform = ((r.get("profile") or {}).get("platform") or {}).get("name")
         r["findings"] = [
             {
                 **f,
@@ -77,6 +80,7 @@ def public_view(scan: Scan, rules: dict[str, dict] | None = None) -> dict:
                 # штрафы всегда по актуальному реестру из админки
                 "penalty": format_penalty(rules[f["id"]]) if f["id"] in rules and f["status"] in ("fail", "warn")
                 else f.get("penalty", ""),
+                "howto": howto(f["id"], platform) if f["status"] in ("fail", "warn") else None,
             }
             for f in r["findings"]
         ]
@@ -140,6 +144,34 @@ async def get_scan(scan_id: str):
     data = public_view(scan, await rules_map())
     data["eta_seconds"] = await runtime.eta_seconds(scan)
     return data
+
+
+async def _done_scan(scan_id: str) -> Scan:
+    async with SessionLocal() as db:
+        scan = await db.get(Scan, scan_id)
+    if not scan or scan.status != "done" or not scan.result:
+        raise HTTPException(404, "Документы доступны после завершения проверки")
+    return scan
+
+
+def _docs(scan: Scan):
+    return documents_for(scan.result, scan.url, (scan.finished_at or scan.created_at).isoformat())
+
+
+@app.get("/api/scans/{scan_id}/documents")
+async def scan_documents(scan_id: str):
+    """Документы под сайт: политика, согласие, чекбоксы, cookie-баннер… — по фактам проверки."""
+    return [{"id": d.id, "title": d.title, "description": d.description, "markdown": to_markdown(d),
+             "filename": d.filename} for d in _docs(await _done_scan(scan_id))]
+
+
+@app.get("/api/scans/{scan_id}/documents/{doc_id}.docx")
+async def scan_document_docx(scan_id: str, doc_id: str):
+    doc = next((d for d in _docs(await _done_scan(scan_id)) if d.id == doc_id), None)
+    if not doc:
+        raise HTTPException(404, "Документ не найден")
+    return Response(to_docx(doc), media_type="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+                    headers={"Content-Disposition": f'attachment; filename="{doc.filename}"'})
 
 
 class FeedbackIn(BaseModel):

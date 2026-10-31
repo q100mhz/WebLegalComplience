@@ -235,3 +235,13 @@ a { color: var(--brand); }
 .concurrency { border-top: 1px solid var(--line); margin-top: 16px; padding-top: 14px; }
 .score.pending { background: var(--line); }
 .spinner.light { border-color: rgba(255,255,255,.5); border-top-color: var(--brand); margin: 0; }
+
+/* Документы и инструкции */
+.doc-list { display: grid; gap: 10px; }
+.doc-card { padding: 14px 16px; }
+.doc-head { display: flex; gap: 16px; justify-content: space-between; align-items: flex-start; flex-wrap: wrap; }
+.doc-head .meta { margin: 2px 0 0; font-size: 13px; }
+.doc-preview { white-space: pre-wrap; font: 13px/1.55 ui-monospace, SFMono-Regular, Menlo, monospace; background: var(--bg);
+  border: 1px solid var(--line); border-radius: 8px; padding: 12px; margin: 12px 0 0; max-height: 480px; overflow: auto; }
+.howto { margin: 4px 0 0; padding-left: 20px; }
+.howto li { margin-bottom: 4px; }

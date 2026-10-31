@@ -12,6 +12,7 @@ export interface Finding {
   penalty: string;
   evidence: string[];
   evidence_total: number;
+  howto?: { platform: string | null; steps: string[] } | null;
 }
 
 export interface ProfileForm {

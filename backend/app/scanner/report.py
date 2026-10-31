@@ -51,6 +51,11 @@ def grade(value: int) -> str:
 def build_report(site: SiteData) -> dict:
     """site.profile может быть частично заполнен заранее (например, данными реестра РКН)."""
     site.profile = {**build_profile(site), **site.profile}
+    # официальное наименование из реестра РКН надёжнее найденного на сайте
+    for recs in ((site.profile.get("rkn") or {}).get("matches") or {}).values():
+        if recs:
+            site.profile["owner"] = {**site.profile.get("owner", {}), "name_official": recs[0].get("name", "")}
+            break
     findings = run_checks(site)
     value = score(findings)
     counts = {s: sum(1 for f in findings if f.status == s) for s in ORDER}

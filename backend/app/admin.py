@@ -19,6 +19,8 @@ from sqlalchemy import Date, cast, func, or_, select, text, update
 
 from . import batches, rkn, runtime
 from .config import settings, shots_dir
+from .documents import documents_for, to_docx
+from .documents.howto import howto
 from .db import Batch, Feedback, RknCheck, Rule, Scan, SessionLocal, kv_get, utcnow
 from .scanner.urls import UrlError, normalize_input, site_key
 
@@ -242,7 +244,12 @@ async def scan_detail(scan_id: str):
             raise HTTPException(404, "Проверка не найдена")
         fb = (await db.execute(select(Feedback).where(Feedback.scan_id == scan_id)
                                .order_by(Feedback.created_at.desc()))).scalars().all()
-    return {**_scan_row(scan), "result": scan.result, "feedback": [_fb_row(f) for f in fb]}
+    result = scan.result
+    if result and result.get("findings"):
+        platform = ((result.get("profile") or {}).get("platform") or {}).get("name")
+        result = {**result, "findings": [{**f, "howto": howto(f["id"], platform) if f["status"] in ("fail", "warn")
+                                          else None} for f in result["findings"]]}
+    return {**_scan_row(scan), "result": result, "feedback": [_fb_row(f) for f in fb]}
 
 
 @router.get("/scans/{scan_id}/shots/{name}", dependencies=[Depends(require_admin)])
@@ -400,6 +407,44 @@ async def restart_batch(batch_id: str, request: Request):
     return await create_batch(BatchIn(name=f"{name} (повтор от {utcnow():%d.%m %H:%M})", urls="\n".join(urls)), request)
 
 
+def _write_docs(zf: zipfile.ZipFile, scan: Scan, folder: str) -> int:
+    if scan.status != "done" or not (scan.result or {}).get("findings"):
+        return 0
+    try:
+        docs = documents_for(scan.result, scan.url, (scan.finished_at or scan.created_at).isoformat())
+    except Exception:  # noqa: BLE001 — документ одного сайта не должен ломать архив
+        return 0
+    for doc in docs:
+        zf.writestr(f"{folder}/{doc.filename}", to_docx(doc))
+    return len(docs)
+
+
+@router.get("/batches/{batch_id}/documents.zip", dependencies=[Depends(require_admin)])
+async def batch_documents(batch_id: str):
+    """Документы для всех проверенных сайтов пакета: папка на сайт — удобно отправлять клиентам."""
+    async with SessionLocal() as db:
+        b = await _get_batch(db, batch_id)
+        scans = (await db.execute(select(Scan).where(Scan.batch_id == batch_id, Scan.status == "done")
+                                  .order_by(Scan.created_at))).scalars().all()
+    tmp = tempfile.SpooledTemporaryFile(max_size=50 * 1024 * 1024)
+    with zipfile.ZipFile(tmp, "w", zipfile.ZIP_DEFLATED) as zf:
+        n = sum(_write_docs(zf, s, s.host) for s in scans)
+        zf.writestr("README.txt", f"Документы для сайтов пакета «{b.name}»: {len(scans)} сайтов, {n} документов.\n"
+                                  "Черновики сформированы по результатам проверки. Поля в квадратных скобках заполните, "
+                                  "тексты согласуйте с юристом.\n")
+    tmp.seek(0)
+
+    def chunks():
+        try:
+            while chunk := tmp.read(1 << 20):
+                yield chunk
+        finally:
+            tmp.close()
+
+    return StreamingResponse(chunks(), media_type="application/zip",
+                             headers={"Content-Disposition": f"attachment; filename=documents-{batch_id[:8]}.zip"})
+
+
 @router.post("/batches/{batch_id}/cancel", dependencies=[Depends(require_admin)])
 async def cancel_batch(batch_id: str):
     async with SessionLocal() as db:
@@ -445,6 +490,7 @@ async def export_zip(days: int = 30, status: str = "", limit: int = 500, batch: 
                                   f"за {days} дн.\nscans.json — результаты; files/<id>/ — скриншоты и site.json.gz "
                                   "(снимок данных, по которым работали правила).\n")
         for s in scans:
+            _write_docs(zf, s, f"files/{s.id}/documents")
             d = shots_dir(s.id)
             if d.is_dir():
                 for f in d.iterdir():
