@@ -15,6 +15,7 @@ export default function Scans() {
   const [q, setQ] = useState("");
   const [status, setStatus] = useState("");
   const [page, setPage] = useState(1);
+  const [days, setDays] = useState("30");
   const [data, setData] = useState<{ total: number; items: Row[] } | null>(null);
 
   useEffect(() => {
@@ -32,6 +33,17 @@ export default function Scans() {
           <option value="">Все статусы</option>
           {["done", "failed", "running", "queued"].map((s) => <option key={s} value={s}>{STATUS_RU[s]}</option>)}
         </select>
+        <div className="export">
+          <select className="input" value={days} onChange={(e) => setDays(e.target.value)} aria-label="Период выгрузки">
+            <option value="7">за 7 дней</option>
+            <option value="30">за 30 дней</option>
+            <option value="90">за 90 дней</option>
+            <option value="365">за год</option>
+          </select>
+          <a className="btn secondary small" href={`/api/admin/export.zip?days=${days}`} title="Результаты, скриншоты и снимки данных для аудита правил">
+            Скачать историю (ZIP)
+          </a>
+        </div>
       </div>
       <div className="table-wrap">
         <table className="table">

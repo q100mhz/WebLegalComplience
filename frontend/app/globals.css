@@ -207,3 +207,5 @@ a { color: var(--brand); }
   .two-col { grid-template-columns: 1fr; }
 }
 .diag-val { max-width: 70%; text-align: right; word-break: break-word; font-size: 13px; }
+.export { display: flex; gap: 8px; align-items: center; margin-left: auto; }
+.export .input { width: auto; }

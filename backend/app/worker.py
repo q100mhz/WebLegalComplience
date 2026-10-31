@@ -12,6 +12,7 @@ from . import rkn
 from .config import settings, shots_dir
 from .db import Scan, SessionLocal, utcnow
 from .scanner.checks.pdn import find_inns
+from .scanner import snapshot
 from .scanner.crawler import BlockedError, crawl
 from .scanner.report import build_report
 
@@ -42,6 +43,10 @@ async def run_scan(ctx, scan_id: str) -> None:
     try:
         site = await asyncio.wait_for(crawl(scan.url, progress, shots_dir(scan_id)), timeout=settings.scan_timeout_s)
         site.profile["rkn"] = await rkn.lookup(find_inns(site))
+        try:  # снимок до построения отчёта: в профиле только данные РКН, остальное пересчитывается
+            snapshot.save(site, shots_dir(scan_id))
+        except Exception:  # noqa: BLE001 — снимок нужен для аудита, проверку из-за него не роняем
+            log.exception("snapshot save failed for %s", scan_id)
         report = build_report(site)
         await _update(
             scan_id, status="done", result=report, score=report["score"],

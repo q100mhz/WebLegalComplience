@@ -4,8 +4,11 @@ import csv
 import hashlib
 import hmac
 import io
+import json
 import re
+import tempfile
 import time
+import zipfile
 from datetime import datetime, timedelta
 
 from fastapi import APIRouter, Cookie, Depends, HTTPException, Request, Response
@@ -186,6 +189,60 @@ async def scan_shot(scan_id: str, name: str):
     if not path.is_file():
         raise HTTPException(404)
     return FileResponse(path, media_type="image/jpeg")
+
+
+@router.get("/export.zip", dependencies=[Depends(require_admin)])
+async def export_zip(days: int = 30, status: str = "", limit: int = 500):
+    """История проверок для аудита правил: scans.json (полные результаты, без IP и контактов пользователей),
+    rules.json (реестр), скриншоты и снимки собранных данных (site.json.gz) каждой проверки."""
+    since = utcnow() - timedelta(days=max(1, min(days, 365)))
+    query = select(Scan).where(Scan.created_at >= since).order_by(Scan.created_at.desc()).limit(max(1, min(limit, 2000)))
+    if status:
+        query = query.where(Scan.status == status)
+    async with SessionLocal() as db:
+        scans = (await db.execute(query)).scalars().all()
+        fb = (await db.execute(select(Feedback).where(Feedback.scan_id.in_([s.id for s in scans])))).scalars().all()
+        rules_rows = (await db.execute(select(Rule))).scalars().all()
+
+    feedback_by_scan: dict[str, list] = {}
+    for f in fb:  # персональные данные пользователей (контакт, IP) в выгрузку не попадают
+        feedback_by_scan.setdefault(f.scan_id, []).append(
+            {"finding_id": f.finding_id, "kind": f.kind, "comment": f.comment, "status": f.status,
+             "admin_note": f.admin_note, "created_at": f.created_at.isoformat()})
+    items = []
+    for s in scans:
+        row = _scan_row(s)
+        row.pop("client_ip", None)
+        d = shots_dir(s.id)
+        items.append({**row, "result": s.result, "feedback": feedback_by_scan.get(s.id, []),
+                      "has_snapshot": (d / "site.json.gz").is_file()})
+
+    tmp = tempfile.SpooledTemporaryFile(max_size=50 * 1024 * 1024)
+    with zipfile.ZipFile(tmp, "w", zipfile.ZIP_DEFLATED) as zf:
+        zf.writestr("scans.json", json.dumps(items, ensure_ascii=False, indent=1))
+        zf.writestr("rules.json", json.dumps([_rule_row(r) for r in rules_rows], ensure_ascii=False, indent=1))
+        zf.writestr("README.txt", f"WebLegalCompliance — выгрузка {utcnow():%Y-%m-%d %H:%M} UTC, проверок: {len(items)}, "
+                                  f"за {days} дн.\nscans.json — результаты; files/<id>/ — скриншоты и site.json.gz "
+                                  "(снимок данных, по которым работали правила).\n")
+        for s in scans:
+            d = shots_dir(s.id)
+            if d.is_dir():
+                for f in d.iterdir():
+                    if f.is_file():
+                        zf.write(f, f"files/{s.id}/{f.name}", compress_type=zipfile.ZIP_STORED
+                                 if f.suffix in (".jpg", ".gz") else zipfile.ZIP_DEFLATED)
+    tmp.seek(0)
+    name = f"wlc-history-{utcnow():%Y%m%d-%H%M}.zip"
+
+    def chunks():
+        try:
+            while chunk := tmp.read(1 << 20):
+                yield chunk
+        finally:
+            tmp.close()
+
+    return StreamingResponse(chunks(), media_type="application/zip",
+                             headers={"Content-Disposition": f"attachment; filename={name}"})
 
 
 @router.post("/scans/{scan_id}/rescan", dependencies=[Depends(require_admin)])
