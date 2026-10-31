@@ -1,5 +1,7 @@
 # WebLegalCompliance
 
+> Идеи, планы и статус их реализации — [docs/IDEAS.md](docs/IDEAS.md).
+
 Онлайн-сервис автоматической проверки сайтов на соответствие законодательству РФ.
 Прод: https://weblegalcompliance.itb2bhost.ru
 
