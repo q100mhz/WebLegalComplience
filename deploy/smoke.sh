@@ -5,7 +5,8 @@ set -euo pipefail
 BASE="${1:-https://weblegalcompliance.itb2bhost.ru}"
 cd "$(dirname "$0")/.."
 set -a; [ -f .env ] && . ./.env; set +a
-J=$(mktemp); trap 'rm -f $J' EXIT
+J=$(mktemp); C=$(mktemp)  # C — cookie сессии админки: удаляется при любом исходе, даже если тест упал
+trap 'rm -f "$J" "$J.zip" "$C"' EXIT
 
 step() { printf '\n== %s\n' "$*"; }
 step "health";  curl -fsS "$BASE/api/health"
@@ -29,9 +30,10 @@ r = d["report"]
 print("score", r["score"], r["counts"], "| тип:", r["profile"]["primary_type"], "| findings:", len(r["findings"]))
 PY
 step "админка"
-C=$(mktemp)
-curl -fsS -c "$C" -X POST "$BASE/api/admin/login" -H 'Content-Type: application/json' \
-  -d "{\"login\":\"$ADMIN_LOGIN\",\"password\":\"$ADMIN_PASSWORD\"}" >/dev/null
+# Вход теми же логином и паролем, что и у человека (из .env на сервере). Пароль передаётся через стандартный
+# ввод, а не аргументом команды — аргументы видны другим пользователям сервера в списке процессов.
+python3 -c 'import json, os; print(json.dumps({"login": os.environ["ADMIN_LOGIN"], "password": os.environ["ADMIN_PASSWORD"]}))' \
+  | curl -fsS -c "$C" -X POST "$BASE/api/admin/login" -H 'Content-Type: application/json' --data @- >/dev/null
 curl -fsS -b "$C" "$BASE/api/admin/stats" | python3 -c 'import sys,json;d=json.load(sys.stdin);print("totals", d["totals"]);print("РКН", d["rkn"])'
 curl -fsS -b "$C" "$BASE/api/admin/rules" | python3 -c 'import sys,json;print("правил в реестре:", len(json.load(sys.stdin)))'
 step "пакетная проверка (2 сайта) и выгрузка архива"
@@ -50,5 +52,4 @@ snaps = [n for n in z.namelist() if n.endswith("site.json.gz")]
 print("в архиве проверок:", len(scans), "| снимков данных:", len(snaps), "| файлов:", len(z.namelist()))
 assert len(scans) == 2 and snaps, "в архиве нет снимков данных"
 PY
-rm -f "$C" "$J.zip"
 echo; echo "SMOKE OK"

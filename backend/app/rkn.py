@@ -150,7 +150,8 @@ def parse_card(page: str) -> dict:
             fields.append((norm(m.group(1)), norm(m.group(2))))
     if not any(CARD_KEYS.search(lbl) for lbl, _ in fields):
         raise PortalUnavailable("не удалось разобрать карточку оператора — изменилась разметка портала")
-    return {"fields": fields[:200], "text": text[:30000]}
+    # у крупных операторов десятки целей обработки: обрезка привела бы к ложному «категория не указана»
+    return {"fields": fields[:2000], "text": text[:30000]}
 
 
 def card_summary(card: dict) -> dict:
@@ -172,7 +173,7 @@ def card_summary(card: dict) -> dict:
         # «Россия» в сведениях о базах данных; иная страна без России — локализация не соблюдена
         "db_russia": bool(re.search(r"росси", db, re.I)) if db else None,
         # категории иногда расписаны внутри каждой цели — тогда ищем по описанию целей
-        "categories_text": (categories or purposes)[:8000],
+        "categories_text": (categories or purposes)[:60000],
         "purposes_text": purposes[:4000],
     }
 

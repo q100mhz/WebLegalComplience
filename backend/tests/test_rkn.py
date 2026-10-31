@@ -94,3 +94,14 @@ def test_card_cross_check():
     assert by_id(build_report(_site_with_card(full, [])))["rkn_notification"]["status"] == "pass"
     # карточку не загрузили → только «не удалось сверить»
     assert by_id(build_report(_site_with_card(None, [])))["rkn_notification"]["status"] == "info"
+
+
+def test_real_portal_card():
+    """Настоящая карточка оператора с pd.rkn.gov.ru (ПАО Сбербанк, 11-0187199)."""
+    from app.rkn import card_summary, parse_card
+    s = card_summary(parse_card((FIX / "rkn_card_11-0187199.html").read_text(encoding="utf-8")))
+    assert s["transborder"] is True and s["transborder_text"] == "Да"
+    assert s["db_russia"] is True and s["db_location"] == "Россия"
+    for cat in ("фамилия", "телефон", "электронной почты"):
+        assert cat in s["categories_text"]
+    assert "Организация, обеспечение и регулирование трудовых" in s["purposes_text"]

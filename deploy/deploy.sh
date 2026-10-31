@@ -3,6 +3,7 @@
 set -euo pipefail
 cd "${APP_DIR:-/opt/welegalcompliance}"
 set -a; [ -f .env ] && . ./.env; set +a
+[ -f .env ] && chmod 600 .env  # пароли и ключи — только владельцу файла
 
 git fetch --prune origin main
 git reset --hard origin/main
