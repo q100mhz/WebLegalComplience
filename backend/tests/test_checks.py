@@ -308,3 +308,109 @@ def test_no_check_raises():
     site.profile = {**build_profile(site), **site.profile}
     for check in CHECKS:
         check(site)  # исключение здесь = ошибка в правиле
+
+
+@pytest.mark.parametrize("title,text,expected", [
+    ("Домен kras-dom.ru продаётся за 150000 ₽", "kras-dom.ru продаётся за 150000 ₽ Купить в магазине Рег.ру", "продажу"),
+    ("RU", "Доменное имя kras-okna.ru продается КУПИТЬ СЕЙЧАС SigmaParking", "продажу"),
+    ("Сайт заблокирован", "Сайт заблокирован Если вы владелец сайта, просто оплатите аккаунт", "хостинг"),
+    ("Запрошенный сайт отсутствует на нашем хостинге", "Сайт отсутствует на нашем хостинге", "нет сайта"),
+    ("Ромашка", "Продаём окна. Доставка. Наш сайт работает с 2010 года. Политика конфиденциальности", None),
+])
+def test_dead_site_detection(title, text, expected):
+    from app.scanner.crawler import _dead_site
+    r = _dead_site(PageData(url="https://x.ru/", status=200, title=title, text=text, links=[Link("/a", "a")] * 5))
+    assert (r is None) if expected is None else (expected in r)
+
+
+def test_policy_page_chosen_by_content_not_title():
+    """У оферты, cookie-страницы и политики может быть один заголовок — выбираем по содержанию."""
+    from app.scanner.checks.common import policy_pages
+    site = good_site()
+    t = "Политика конфиденциальности"
+    offer = PageData(url="https://example.ru/oferta/", status=200, title=t, text="Оферта маркетплейса. " * 120 + "персональных данных")
+    cookie = PageData(url="https://example.ru/cookie/", status=200, title=t, text="Мы используем cookie. " * 100 + "персональных данных")
+    site.pages = [site.pages[0], offer, cookie, site.pages[1]]
+    assert policy_pages(site)[0].url == "https://example.ru/privacy"
+
+
+def test_weak_linked_policy_is_analyzed_not_skipped():
+    site = good_site()
+    site.pages[1].text = "Privacy Policy. Мы уважаем вашу конфиденциальность и персональные данные. " * 20
+    f = by_id(build_report(site))["policy_content"]
+    assert f["status"] in ("fail", "warn") and f["evidence"] == ["https://example.ru/privacy"]
+
+
+# ---------- Аудит 01.11.2026: регрессионные тесты на найденные ошибки ----------
+
+def _consent_site(form_text, submit="Перезвоните мне", page_text=""):
+    site = good_site()
+    f = site.pages[0].forms[0]
+    f.checkboxes, f.links, f.text, f.submit = [], [], form_text, submit
+    site.pages[0].text += page_text
+    return site
+
+
+@pytest.mark.parametrize("text", [
+    "Продолжая вы соглашаетесь со сбором и обработкой персональных данных и пользовательским соглашением",
+    "Нажимая «отправить», вы соглашаетесь со сбором и обработкой персональных данных",
+    "Нажимая кнопку \"Отправить\", Вы даёте согласие на обработку персональных данных",
+])
+def test_passive_consent_is_warn_not_absent(text):
+    f = by_id(build_report(_consent_site("Имя Телефон " + text)))["forms_consent"]
+    assert f["status"] == "warn"
+
+
+def test_bundled_consent_is_called_out():
+    f = by_id(build_report(_consent_site(
+        "Продолжая вы соглашаетесь со сбором и обработкой персональных данных и пользовательским соглашением")))["forms_consent"]
+    assert "пользовательского соглашения" in f["summary"] and f["severity"] == "high"
+
+
+def test_consent_phrase_right_below_form_is_seen():
+    site = _consent_site("Имя Телефон", submit="Отправить заявку",
+                         page_text="\nОтправить заявку\nНажимая на кнопку, вы даете согласие на обработку персональных данных")
+    assert by_id(build_report(site))["forms_consent"]["status"] == "warn"
+
+
+def test_address_lookup_field_is_not_a_pd_form():
+    from app.scanner.checks.common import form_is_pd
+    assert not form_is_pd(Form(action="", method="get", inputs=[FormInput("text", "zones_address", "Улица, дом *")],
+                               checkboxes=[], text="Введите адрес", links=[], submit=""))
+
+
+def test_wrapper_container_is_not_a_separate_form():
+    from app.scanner.checks.common import page_forms
+    inner = Form(action="", method="post", inputs=[FormInput("text", "name"), FormInput("tel", "phone")],
+                 checkboxes=[], text="", links=[], submit="Отправить")
+    wrapper = Form(action="", method="get", inputs=[FormInput("text", "addr"), FormInput("text", "name"),
+                   FormInput("tel", "phone")], checkboxes=[], text="", links=[], submit="Отправить")
+    assert page_forms(PageData(url="https://x.ru/", status=200, forms=[inner, wrapper])) == [inner]
+
+
+def test_alcohol_as_cake_ingredient_is_not_restricted_goods():
+    from app.scanner.profile import build_profile
+    site = good_site()
+    site.pages[0].text = ("Торт «Прага». Состав: мука, сахар, ванилин, лимонная кислота, коньяк.\n1320 ₽\nЗаказать\n" * 3)
+    assert "Алкоголь" not in build_profile(site)["restricted"]
+    site.pages[0].text = "Коньяк армянский 5 лет, 0,5 л, 40%\n2 390 ₽\nВ корзину"
+    assert "Алкоголь" in build_profile(site)["restricted"]
+
+
+def test_buy_button_for_service_is_not_a_shop():
+    from app.scanner.checks.content import check_ecommerce
+    site = good_site()
+    site.pages[0].buttons = ["КУПИТЬ", "Оставить заявку"]
+    site.pages[0].text += "\nАудит портала Битрикс24 — 25 000 ₽\nКУПИТЬ"
+    assert check_ecommerce(site) is None
+    site.pages[0].buttons.append("В корзину")
+    assert check_ecommerce(site) is not None
+
+
+def test_registration_word_in_text_is_not_a_registration_feature():
+    from app.scanner.profile import build_profile
+    site = good_site()
+    site.pages[0].text += "\nАдрес регистрации: г. Омск. Электронная регистрация сделок."
+    assert "registration" not in build_profile(site)["features"]
+    site.pages[0].links.append(Link("/auth/?register=yes", "Регистрация"))
+    assert "registration" in build_profile(site)["features"]

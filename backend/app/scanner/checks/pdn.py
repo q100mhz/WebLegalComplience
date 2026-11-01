@@ -78,7 +78,8 @@ def check_policy_content(site: SiteData) -> Finding | None:
                 recommendation="Рекомендуем публиковать политику HTML-страницей: её проще индексировать и читать.",
             )
         return None
-    text = max(pages, key=lambda p: len(p.text)).text
+    best = pages[0]  # лучшая по содержанию — не самая длинная (ею может оказаться оферта)
+    text = best.text
     missing = [name for name, rx in POLICY_ELEMENTS.items() if not re.search(rx, text, re.I | re.S)]
     if any(match_service(u) and match_service(u).foreign for u in site.all_request_urls()):
         if not re.search(r"трансграничн", text, re.I):
@@ -91,7 +92,7 @@ def check_policy_content(site: SiteData) -> Finding | None:
         missing.append("упоминание используемых сервисов аналитики: " + ", ".join(unnamed))
     base = dict(
         id="policy_content", category=CAT, title="Содержание политики обработки ПДн",
-        law="152-ФЗ, ст. 14, 18.1; рекомендации РКН", evidence=[pages[0].url],
+        law="152-ФЗ, ст. 14, 18.1; рекомендации РКН", evidence=[best.url],
     )
     if not missing:
         return Finding(**base, status="pass", severity="low", summary="Политика содержит все основные обязательные разделы.")
@@ -105,7 +106,24 @@ def check_policy_content(site: SiteData) -> Finding | None:
     )
 
 
-IMPLIED_RE = re.compile(r"(нажима|отправля|оставля|заполня)\w*.{0,80}(соглаша|согласи|принима|подтвержда)", re.I | re.S)
+# Пассивное согласие: «Продолжая / Нажимая кнопку / Отправляя форму, вы соглашаетесь…»
+IMPLIED_RE = re.compile(
+    r"(продолжая|нажима\w*|отправля\w*|оставля\w*|заполня\w*|регистрируясь|авторизуясь|используя|кликая|указывая|"
+    r"подтвержда\w*)[^.!?]{0,160}?(соглаша\w*|согласи\w*|принима\w*|подтвержда\w*|даёт\w*|дает\w*|даю)", re.I | re.S)
+BUNDLED_RE = re.compile(r"пользовательск\w+\s+соглашени|оферт|правил\w*\s+(сайта|сервиса|пользования)|услови\w+\s+(использования|продажи)", re.I)
+
+
+def near_form_text(page, form) -> str:
+    """Текст страницы сразу после кнопки отправки: фразу о согласии часто ставят под формой, за её границей."""
+    label = (form.submit.split("|")[0].strip() or "")[:40]
+    label = re.sub(r"\s*[#.][\w-]+.*$", "", label)  # «Отправить #rec123 .t-btn» → «Отправить» (Tilda)
+    if len(label) < 3:
+        return ""
+    for m in re.finditer(re.escape(label), page.text, re.I):
+        win = page.text[m.end():m.end() + 350]
+        if IMPLIED_RE.search(win) or CONSENT_TEXT_RE.search(win) or re.search(r"персональн\w+\s+данн", win, re.I):
+            return win
+    return ""
 
 
 def check_forms_consent(site: SiteData) -> Finding:
@@ -113,7 +131,7 @@ def check_forms_consent(site: SiteData) -> Finding:
     base = dict(id="forms_consent", category=CAT, title="Согласие на обработку ПДн в формах", law="152-ФЗ, ст. 9")
     if not forms:
         return Finding(**base, status="info", severity="low", summary="Формы сбора персональных данных не обнаружены.")
-    bad: dict[str, list[str]] = defaultdict(list)
+    bad: dict[str, list[str]] = defaultdict(list)  # none | prechecked | implied | bundled | no_link
     for page, f in forms:
         consent_boxes = [c for c in f.checkboxes if re.search(r"согла|персональн|политик|обработк|конфиденц", c.label, re.I)]
         fields = ", ".join(field_label(i) for i in f.inputs[:4])
@@ -123,8 +141,11 @@ def check_forms_consent(site: SiteData) -> Finding:
         elif consent_boxes:
             if not any(link_is_policy(l) or link_is_consent(l) for l in f.links):
                 bad["no_link"].append(where)
-        elif IMPLIED_RE.search(f.text) or CONSENT_TEXT_RE.search(f.text):
-            bad["implied"].append(where)
+        elif (m := IMPLIED_RE.search(consent_text := f.text + " " + near_form_text(page, f))) or CONSENT_TEXT_RE.search(consent_text):
+            quote = consent_text[m.start():m.start() + 200].split("\n")[0].strip() if m else ""
+            bad["implied"].append(where + (f" — «{quote[:160]}»" if quote else ""))
+            if m and BUNDLED_RE.search(consent_text[m.start():m.start() + 260]):
+                bad["bundled"].append(where)
         else:
             bad["none"].append(where)
 
@@ -142,11 +163,26 @@ def check_forms_consent(site: SiteData) -> Finding:
             evidence=(bad["none"] + bad["prechecked"])[:10],
         )
     if bad["implied"] or bad["no_link"]:
+        parts = []
+        if bad["implied"]:
+            parts.append(
+                f"В {len(bad['implied'])} форм(ах) согласие выражено фразой вида «Продолжая (нажимая кнопку), вы "
+                "соглашаетесь…» без отдельного действия пользователя. Закон не требует именно чекбокс, но согласие "
+                "должно быть конкретным, сознательным и однозначным (ч. 1 ст. 9 152-ФЗ), а с 01.09.2025 — оформленным "
+                "отдельно от иных документов. Пассивная формулировка с высокой вероятностью будет признана "
+                "ненадлежащим согласием.")
+        if bad["bundled"]:
+            parts.append(f"В {len(bad['bundled'])} форм(ах) согласие на обработку ПДн объединено в одной фразе с "
+                         "принятием пользовательского соглашения или оферты — это прямо противоречит требованию "
+                         "оформлять согласие отдельно.")
+        if bad["no_link"]:
+            parts.append(f"В {len(bad['no_link'])} форм(ах) есть чекбокс, но нет ссылки на текст согласия или политику.")
         return Finding(
-            **base, status="warn", severity="medium",
-            summary="Согласие оформлено формулировкой «нажимая кнопку, вы соглашаетесь…» или без ссылки на документ — "
-            "такое согласие сложно признать конкретным, информированным и сознательным.",
-            recommendation="Замените пассивную формулировку на отдельный чекбокс со ссылкой на текст согласия.",
+            **base, status="warn", severity="high" if bad["bundled"] else "medium",
+            summary=" ".join(parts),
+            recommendation="Замените фразу на отдельный обязательный чекбокс без отметки по умолчанию: «Я даю согласие на "
+            "обработку персональных данных» со ссылкой на отдельный документ согласия; принятие пользовательского "
+            "соглашения — отдельным чекбоксом.",
             evidence=(bad["implied"] + bad["no_link"])[:10],
         )
     return Finding(**base, status="pass", severity="low", summary=f"Все формы с ПДн ({len(forms)}) содержат чекбокс согласия.")
@@ -170,10 +206,15 @@ def check_separate_consent(site: SiteData) -> Finding | None:
             "в настройках «Отмечено по умолчанию».",
         )
     if not consent_links:
+        # из форм часто ведёт ссылка на политику — это не согласие, объясняем почему
+        form_policy = next((abs_link(p, l) for p, f in unique_pd_forms(site) for l in f.links if link_is_policy(l)), None)
+        explain = (f" Ссылка из формы ведёт на политику ({short(form_policy, 90)}). Политика — документ оператора о том, "
+                   "как он обрабатывает данные (ст. 18.1); согласие — отдельный документ субъекта с целями, перечнем "
+                   "данных, сроком и порядком отзыва (ч. 4 ст. 9). Политика согласие не заменяет.") if form_policy else ""
         return Finding(
             **base, status="fail", severity="medium",
             summary="Не найден отдельный текст согласия на обработку ПДн. С 1 сентября 2025 года согласие должно "
-            "оформляться отдельно от политики, оферты и иных документов.",
+            "оформляться отдельно от политики, оферты и иных документов." + explain,
             recommendation="Опубликуйте отдельную страницу «Согласие на обработку персональных данных» "
             "(цели, перечень данных, действия, срок, порядок отзыва) и ссылайтесь на неё из чекбокса в формах.",
         )
@@ -360,8 +401,10 @@ def check_rkn_notification(site: SiteData) -> Finding | None:
     foreign = sorted({s["name"] for s in site.profile.get("services", [])
                       if s.get("foreign") and s["category"] in ("analytics", "ads", "chat", "captcha")})
     if foreign and card.get("transborder") is False:
-        fails.append(f"в уведомлении трансграничная передача не заявлена, а сайт передаёт данные иностранным "
-                     f"сервисам: {', '.join(foreign)}")
+        msg = (f"в уведомлении трансграничная передача не заявлена, а сайт передаёт данные иностранным "
+               f"сервисам: {', '.join(foreign)}")
+        # один Google Tag Manager — контейнер без доказанного сбора данных: риск, как и в правиле foreign_services
+        (warns if foreign == ["Google Tag Manager"] else fails).append(msg)
     if card.get("db_russia") is False:
         fails.append(f"базы данных в уведомлении указаны не в России: «{card.get('db_location', '')[:150]}»")
 

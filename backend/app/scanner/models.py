@@ -36,6 +36,7 @@ class Form:
     submit: str = ""
     index: int = -1
     screenshot: str | None = None
+    popup: bool = False  # форма из всплывающего окна (появилась после нажатия кнопки)
 
 
 @dataclass

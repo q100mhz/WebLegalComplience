@@ -8,7 +8,10 @@ interface RknRecord {
   reg_number: string; name: string; basis: string; reg_date: string; start_date: string; url: string;
   card?: RknCard; card_error?: string;
 }
-interface Check { inn: string; found?: boolean; records?: RknRecord[]; checked_at?: string; cached?: boolean; error?: string }
+interface Check {
+  inn: string; found?: boolean; records?: RknRecord[]; checked_at?: string; cached?: boolean; error?: string;
+  debug?: { page_len?: number; table?: boolean; rows?: number; first_row?: string };
+}
 interface Status {
   status?: string; last_ok?: string; last_error?: string; error?: string; requests?: number; errors?: number;
   cached: number; cached_found: number; recent: Check[];
@@ -71,7 +74,17 @@ export default function Rkn() {
 
 function CheckView({ c, compact }: { c: Check; compact?: boolean }) {
   if (c.error) return <p className="form-error">ИНН {c.inn}: портал недоступен — {c.error}</p>;
-  if (!c.found) return <div className="row"><span>ИНН {c.inn}</span><span className="txt-bad">нет в реестре · {fmtDate(c.checked_at)}</span></div>;
+  if (!c.found) return (
+    <>
+      <div className="row"><span>ИНН {c.inn}</span><span className="txt-bad">нет в реестре · {fmtDate(c.checked_at)}</span></div>
+      {c.debug && (
+        <p className="meta">
+          Ответ портала: таблица результатов {c.debug.table ? "есть" : "нет"}, строк {c.debug.rows ?? 0}
+          {c.debug.first_row ? `, первая: «${c.debug.first_row}»` : ""}
+        </p>
+      )}
+    </>
+  );
   return (
     <>
       {c.records!.map((r) => (

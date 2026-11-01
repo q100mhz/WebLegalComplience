@@ -68,13 +68,15 @@ def parse_search(page: str, inn: str) -> list[dict]:
         if len(cells) < 4 or tr.getparent().tag == "thead":
             continue
         txt = [re.sub(r"\s+", " ", c.text_content()).strip() for c in cells]
-        m = INN_IN_CELL_RE.search(txt[1])
-        if not m or m.group(1) != inn:
+        row_inns = re.findall(r"(?<!\d)(\d{10}|\d{12})(?!\d)", " ".join(txt[1:2]))
+        # Поиск шёл по ИНН — строка без ИНН (так портал может показывать ИП) относится к нему.
+        # Если ИНН в строке есть, он должен совпадать: защита от «похожих» результатов.
+        if row_inns and inn not in row_inns:
             continue
         link = cells[1].xpath(".//a")
         records.append({
             "reg_number": txt[0],
-            "name": (link[0].text_content().strip() if link else txt[1].split("ИНН:")[0]).strip()[:500],
+            "name": (link[0].text_content().strip() if link else re.split(r"ИНН", txt[1])[0]).strip()[:500],
             "basis": txt[2][:200],
             "reg_date": txt[3],
             "start_date": txt[4] if len(txt) > 4 else "",
@@ -111,8 +113,23 @@ async def _get(client: httpx.AsyncClient, params: dict) -> str:
     return r.text
 
 
-async def _fetch(client: httpx.AsyncClient, inn: str) -> list[dict]:
-    return parse_search(await _get(client, {"act": "search", "name_full": "", "inn": inn, "regn": ""}), inn)
+def search_debug(page: str) -> dict:
+    """Что вернул портал — для разбора случаев «не найден» (видно в админке и в архиве аудита)."""
+    try:
+        doc = lh.document_fromstring(page)
+        rows = doc.xpath("//table[@id='ResList1']//tr[td]")
+        data_rows = [r for r in rows if r.getparent().tag != "thead"]
+        first = re.sub(r"\s+", " ", data_rows[0].text_content()).strip()[:300] if data_rows else ""
+        return {"page_len": len(page), "table": bool(doc.xpath("//table[@id='ResList1']")), "rows": len(data_rows),
+                "first_row": first}
+    except Exception:  # noqa: BLE001
+        return {"page_len": len(page)}
+
+
+async def _fetch(client: httpx.AsyncClient, inn: str) -> tuple[list[dict], dict]:
+    page = await _get(client, {"act": "search", "name_full": "", "inn": inn, "regn": ""})
+    records = parse_search(page, inn)
+    return records, ({} if records else search_debug(page))
 
 
 # ---------- Карточка оператора ----------
@@ -205,7 +222,9 @@ async def check_inn(inn: str, client: httpx.AsyncClient | None = None, use_cache
     own = client is None
     client = client or httpx.AsyncClient(timeout=20, headers=HEADERS, follow_redirects=True)
     try:
-        records = await _fetch(client, inn)
+        records, debug = await _fetch(client, inn)
+        if debug:
+            log.info("RKN: %s not found, portal returned %s", inn, debug)
         if records:  # карточка — для сверки сведений уведомления с сайтом; её сбой не отменяет «найден в реестре»
             try:
                 records[0]["card"] = await _fetch_card(client, records[0]["reg_number"])
@@ -227,7 +246,8 @@ async def check_inn(inn: str, client: httpx.AsyncClient | None = None, use_cache
         else:
             db.add(RknCheck(inn=inn, found=bool(records), records=records, checked_at=now))
         await db.commit()
-    return {"inn": inn, "found": bool(records), "records": records, "checked_at": now.isoformat(), "cached": False}
+    return {"inn": inn, "found": bool(records), "records": records, "checked_at": now.isoformat(), "cached": False,
+            **({"debug": debug} if debug else {})}
 
 
 async def lookup(inns: list[str]) -> dict:
@@ -244,4 +264,5 @@ async def lookup(inns: list[str]) -> dict:
         "matches": {r["inn"]: r["records"] for r in ok},
         "checked_at": max((r["checked_at"] for r in ok), default=None),
         "errors": {r["inn"]: r["error"] for r in results if "error" in r},
+        "debug": {r["inn"]: r["debug"] for r in results if r.get("debug")},
     }

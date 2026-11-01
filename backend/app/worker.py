@@ -145,13 +145,10 @@ async def _scan(ctx, scan: Scan) -> None:
 
 
 async def cleanup_shots(ctx) -> None:
-    root = Path(settings.data_dir) / "shots"
-    if not root.exists():
-        return
-    limit = time.time() - settings.screenshots_keep_days * 86400
-    for d in root.iterdir():
-        if d.is_dir() and d.stat().st_mtime < limit:
-            shutil.rmtree(d, ignore_errors=True)
+    """Каждую ночь удаляем скриншоты и снимки данных старше срока хранения из админки."""
+    keep = (await runtime.get_settings())["keep_days"]
+    result = await asyncio.to_thread(runtime.cleanup_data, keep)
+    log.info("cleanup: keep %s days, %s", keep, result)
 
 
 async def pump_batches(ctx) -> None:

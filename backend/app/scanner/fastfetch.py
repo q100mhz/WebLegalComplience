@@ -66,6 +66,15 @@ def _links(base: str, root) -> list[Link]:
     return [Link(href=a.get("href", ""), text=_text(a)[:200]) for a in root.iter("a") if a.get("href")][:2000]
 
 
+def _next_siblings(el, n: int) -> list:
+    out, cur = [], el.getnext()
+    while cur is not None and len(out) < n:
+        if isinstance(cur.tag, str):
+            out.append(cur)
+        cur = cur.getnext()
+    return out
+
+
 def _form(doc, base: str, container, idx: int) -> Form | None:
     inputs = []
     for i in container.iter("input", "textarea", "select"):
@@ -89,7 +98,9 @@ def _form(doc, base: str, container, idx: int) -> Form | None:
     return Form(
         action=container.get("action", "") if container.tag == "form" else "",
         method=(container.get("method") or "get").lower() if container.tag == "form" else "get",
-        inputs=inputs, checkboxes=checkboxes, text=_text(container)[:3000], links=_links(base, container),
+        inputs=inputs, checkboxes=checkboxes, links=_links(base, container),
+        # фразу о согласии часто ставят сразу под формой — берём и текст следующих блоков
+        text=(_text(container) + " " + " ".join(_text(n) for n in _next_siblings(container, 2))[:400])[:3400],
         submit=" | ".join(s for s in submits if s)[:300], index=idx,
     )
 

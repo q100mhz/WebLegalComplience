@@ -30,9 +30,10 @@ def check_https(site: SiteData) -> Finding:
         problems.append("не настроен заголовок HSTS")
     if not problems:
         return Finding(**base, status="pass", severity="low", summary="HTTPS настроен, есть редирект с HTTP и HSTS.")
+    only_hsts = problems == ["не настроен заголовок HSTS"]  # не требование закона, а рекомендация по защите
     return Finding(
         **base,
-        status="fail" if insecure_forms else "warn",
+        status="fail" if insecure_forms else "info" if only_hsts else "warn",
         severity="high" if insecure_forms else "low",
         evidence=insecure_forms[:5],
         summary="HTTPS работает, но: " + "; ".join(problems) + ".",

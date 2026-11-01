@@ -1,5 +1,6 @@
 """API админки: дашборд, проверки, сайты, реестр нарушений, обратная связь, реестр РКН."""
 
+import asyncio
 import csv
 import hashlib
 import hmac
@@ -149,6 +150,7 @@ async def stats():
 class RuntimeIn(BaseModel):
     scan_concurrency: int | None = None
     max_pages: int | None = None
+    keep_days: int | None = None
 
 
 def _runtime_view(cfg: dict) -> dict:
@@ -168,7 +170,20 @@ async def put_runtime_settings(body: RuntimeIn):
         raise HTTPException(422, f"Одновременных проверок — от 1 до {settings.max_concurrency}")
     if body.max_pages is not None and not settings.min_pages_limit <= body.max_pages <= settings.max_pages_limit:
         raise HTTPException(422, f"Глубина проверки — от {settings.min_pages_limit} до {settings.max_pages_limit} страниц")
-    return _runtime_view(await runtime.update_settings(body.scan_concurrency, body.max_pages))
+    return _runtime_view(await runtime.update_settings(body.scan_concurrency, body.max_pages, body.keep_days))
+
+
+@router.get("/storage", dependencies=[Depends(require_admin)])
+async def storage():
+    return {**(await asyncio.to_thread(runtime.storage_stats)), "keep_days": (await runtime.get_settings())["keep_days"],
+            "choices": list(runtime.KEEP_DAYS_CHOICES)}
+
+
+@router.post("/storage/cleanup", dependencies=[Depends(require_admin)])
+async def storage_cleanup():
+    """Удалить сейчас скриншоты и снимки данных старше срока хранения."""
+    keep = (await runtime.get_settings())["keep_days"]
+    return {**(await asyncio.to_thread(runtime.cleanup_data, keep)), "keep_days": keep}
 
 
 LOAD_RANGES = {6: (300, 30), 24: (900, 60), 168: (7200, 600)}  # часы → (размер столбца, шаг выборки), сек
@@ -448,7 +463,7 @@ async def cancel_batch(batch_id: str):
 
 
 @router.get("/export.zip", dependencies=[Depends(require_admin)])
-async def export_zip(days: int = 30, status: str = "", limit: int = 500, batch: str = ""):
+async def export_zip(days: int = 30, status: str = "", limit: int = 500, batch: str = "", docs: bool = False):
     """История проверок для аудита правил: scans.json (полные результаты, без IP и контактов пользователей),
     rules.json (реестр), скриншоты и снимки собранных данных (site.json.gz) каждой проверки."""
     since = utcnow() - timedelta(days=max(1, min(days, 365)))
@@ -482,9 +497,11 @@ async def export_zip(days: int = 30, status: str = "", limit: int = 500, batch: 
         zf.writestr("rules.json", rules_json)
         zf.writestr("README.txt", f"WebLegalCompliance — выгрузка {utcnow():%Y-%m-%d %H:%M} UTC, проверок: {len(items)}, "
                                   f"за {days} дн.\nscans.json — результаты; files/<id>/ — скриншоты, site.json.gz "
-                                  "(снимок данных, по которым работали правила) и documents/ (документы под сайт).\n")
+                                  "(снимок данных, по которым работали правила)"
+                                  + (" и documents/ (документы под сайт)" if docs else "") + ".\n")
         for s in scans:
-            _write_docs(zf, s, f"files/{s.id}/documents")
+            if docs:  # для аудита документы не нужны (+30% к размеру); у них отдельная кнопка
+                _write_docs(zf, s, f"files/{s.id}/documents")
             d = shots_dir(s.id)
             if d.is_dir():
                 for f in d.iterdir():

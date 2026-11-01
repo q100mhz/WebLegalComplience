@@ -40,16 +40,38 @@ def policy_links(site: SiteData) -> list[tuple[PageData, Link]]:
     return [(p, l) for p, l in site.all_links() if link_is_policy(l)]
 
 
+POLICY_SECTIONS_RE = [re.compile(rx, re.I) for rx in (
+    r"цел\w*\s+(обработки|сбора)", r"правов\w*\s+основани", r"категори\w*\s+субъект", r"срок\w*\s+(обработки|хранения)",
+    r"уничтожени", r"прав\w*\s+субъект", r"трансграничн", r"оператор\w*\s+(обязан|вправе|осуществляет)",
+    r"152-ФЗ|О\s+персональных\s+данных",
+)]
+
+
+def policy_score(p: PageData) -> int:
+    """Насколько страница похожа на саму политику обработки ПДн — по содержанию, а не по заголовку:
+    на многих сайтах у оферты, cookie-уведомления и политики одинаковый заголовок."""
+    mentions = len(re.findall(r"персональн\w+\s+данн", p.text, re.I))
+    sections = sum(1 for rx in POLICY_SECTIONS_RE if rx.search(p.text))
+    named = 3 if (POLICY_TEXT_RE.search(f"{p.title} {p.text[:400]}") or POLICY_HREF_RE.search(urlsplit(p.url).path)) else 0
+    return sections * 10 + min(mentions, 30) + named
+
+
 def policy_pages(site: SiteData) -> list[PageData]:
-    """Страницы, похожие на саму политику обработки ПДн."""
-    res = []
+    """Страницы, похожие на политику обработки ПДн, — лучшая первой.
+    Кандидаты: страницы, на которые ведёт ссылка «Политика…» (даже слабые — их недостатки и нужно показать),
+    и страницы, похожие на политику по содержанию. Выбор — по содержанию: заголовок у оферты и политики бывает один."""
+    linked = {abs_link(p, l).split("#")[0].rstrip("/") for p, l in site.all_links() if link_is_policy(l)}
+    cands = []
     for p in site.pages[1:] or []:
-        head = f"{p.url} {p.title} {p.text[:400]}"
-        if (POLICY_TEXT_RE.search(head) or POLICY_HREF_RE.search(urlsplit(p.url).path)) and re.search(
-            r"персональн\w+\s+данн", p.text, re.I
-        ) and len(p.text) > 1500:
-            res.append(p)
-    return res
+        if len(p.text) < 800:
+            continue
+        is_target = p.url.split("#")[0].rstrip("/") in linked
+        score = policy_score(p) + (15 if is_target else 0)
+        if (is_target and re.search(r"персональн\w+\s+данн|конфиденциальн|privacy", p.text, re.I)) or (
+            score >= 25 and re.search(r"персональн\w+\s+данн", p.text, re.I)
+        ):
+            cands.append((score, p))
+    return [p for _, p in sorted(cands, key=lambda x: -x[0])]
 
 
 def input_is_pd(i) -> bool:
@@ -62,6 +84,9 @@ def input_is_pd(i) -> bool:
 
 
 def form_is_pd(f: Form) -> bool:
+    # одно поле без кнопки отправки (не e-mail и не телефон) — это поиск или проверка адреса доставки, а не сбор данных
+    if len(f.inputs) == 1 and not f.submit.strip() and f.inputs[0].type not in ("email", "tel"):
+        return False
     return any(input_is_pd(i) for i in f.inputs)
 
 
@@ -77,9 +102,9 @@ SERVICE_FORM_RE = re.compile(
 )
 
 
-SERVICE_URL_RE = re.compile(r"forgot|change_?password|restore|recover|reset|unsubscribe", re.I)
+SERVICE_URL_RE = re.compile(r"forgot|change_?password|restore|recover|reset|unsubscribe|/login|signin|/auth(?!.*regist)", re.I)
 # Кнопка «Подписаться», «Отправить заявку» и т.п. — значит, форма собирает данные новых людей
-NEW_DATA_SUBMIT_RE = re.compile(r"подписат|зарегистр|отправить|оставить|заказ|купить|записат|получить|subscribe|sign\s?up|send", re.I)
+NEW_DATA_SUBMIT_RE = re.compile(r"подписат|зарегистр|регистрац|отправить|оставить|заказ|купить|записат|получить|subscribe|sign\s?up|send", re.I)
 
 
 def is_service_form(f: Form, page_url: str = "") -> bool:
@@ -94,13 +119,31 @@ def field_label(i) -> str:
     return (i.placeholder or "").strip() or (i.name or "").strip() or i.type
 
 
+def page_forms(page: PageData) -> list[Form]:
+    """Формы страницы без «обёрток»: когда поля не обёрнуты в <form>, сканер видит и сами формы, и общий блок
+    вокруг нескольких форм. Блок, содержащий все поля другой формы и что-то сверх того, — обёртка, а не форма."""
+    def names(f: Form) -> frozenset:
+        return frozenset(f"{i.type}:{i.name or i.placeholder}" for i in f.inputs)
+    sets = [names(f) for f in page.forms]
+    out, seen = [], set()
+    for f, n in zip(page.forms, sets):
+        if any(other < n for other in sets if other):  # строгое подмножество — f объемлет другую форму
+            continue
+        sig = form_signature(f)
+        if sig in seen:
+            continue
+        seen.add(sig)
+        out.append(f)
+    return out
+
+
 def unique_pd_forms(site: SiteData) -> list[tuple[PageData, Form]]:
     """Формы, которые собирают ПДн новых людей, без дублей (форма в футере повторяется на каждой странице).
     Служебные формы (вход, восстановление пароля, управление подпиской) не считаются."""
     seen: set[str] = set()
     res = []
     for p in site.pages:
-        for f in p.forms:
+        for f in page_forms(p):
             if not form_is_pd(f) or is_service_form(f, p.url):
                 continue
             sig = form_signature(f)

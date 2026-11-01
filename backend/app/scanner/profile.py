@@ -7,7 +7,7 @@
 import re
 from collections import Counter
 
-from .checks.common import all_text, field_label, form_is_pd, form_signature, input_is_pd, is_service_form
+from .checks.common import all_text, field_label, form_is_pd, form_signature, input_is_pd, is_service_form, page_forms
 from .models import Form, SiteData
 from .services_db import match_service, match_tracking_cookie
 
@@ -33,6 +33,8 @@ RESTRICTED = {
     "Рецептурные лекарства": r"рецептурн\w+\s+(препарат|лекарств)",
 }
 
+ALCO_PRODUCT_RE = re.compile(r"\d+(?:[.,]\d+)?\s?(?:%|градус)|\b\d(?:[.,]\d{1,3})?\s?л\b|\b\d{3,4}\s?мл\b|"
+                             r"крепост|выдержк|объ[её]м", re.I)
 PRICE_CTX_RE = re.compile(r"\d[\d\s]{0,9}(?:[.,]\d{1,2})?\s?(₽|руб)|в\s+корзину|купить|заказать", re.I)
 
 # Платформы: (название, признак в HTML/скриптах/заголовках, иностранная?)
@@ -84,10 +86,16 @@ SPECIAL_RE = re.compile(
 )
 CARD_RE = re.compile(r"cc-?number|card-?number|cardnumber|\bpan\b|номер\s+карты|cvv|cvc", re.I)
 
+REG_NAV_RE = re.compile(r"(регистрация|зарегистрироваться|личный\s+кабинет|войти\s+в\s+(личный\s+)?кабинет|sign\s?up|"
+                        r"создать\s+(аккаунт|профиль))$", re.I)
+
 FEATURES: dict[str, tuple[str, str]] = {
     "registration": ("Регистрация и личный кабинет", r"регистрац|зарегистр|личный\s+кабинет|sign\s?up"),
     "subscription": ("Подписка / автоплатёж", r"автопродлен|автоплат[её]ж|рекуррент|подписк\w+\s+(на\s+)?(месяц|год)|ежемесячн\w+\s+(платеж|оплат|списани)"),
-    "recommendations": ("Рекомендательные алгоритмы", r"рекомендуем\s+вам|вам\s+может\s+понравиться|персональн\w+\s+рекомендац|рекомендации\s+для\s+вас|с\s+этим\s+товаром\s+покупают|похожие\s+товары|подобрали\s+для\s+вас"),
+    # Только персональные рекомендации (на основе данных о пользователе) — ст. 10.2-2 149-ФЗ;
+    # «Похожие товары» и «С этим товаром покупают» не персонализированы и под закон не подпадают
+    "recommendations": ("Персональные рекомендации", r"вам\s+может\s+понравиться|персональн\w+\s+рекомендац|рекомендации\s+для\s+вас|"
+                        r"подобрали\s+для\s+вас|на\s+основе\s+ваших\s+(просмотров|покупок|интересов)|специально\s+для\s+вас\s+подобрал"),
     "reviews": ("Отзывы пользователей", r"\bотзыв(ы|ов)\b"),
     "online_payment": ("Онлайн-оплата", r"оплатить\s+онлайн|оплата\s+картой\s+на\s+сайте|онлайн-оплат"),
     "supplements": ("БАД", r"\bбад\b|биологически\s+активн\w+\s+добавк"),
@@ -158,8 +166,13 @@ def build_profile(site: SiteData) -> dict:
     if not platform and home and home.generator:
         platform = {"name": home.generator[:60], "foreign": False}
 
-    features = {code: name for code, (name, rx) in FEATURES.items() if re.search(rx, hay, re.I)}
-    if any(i.type == "password" for p in site.pages for f in p.forms for i in f.inputs):
+    features = {code: name for code, (name, rx) in FEATURES.items() if code != "registration" and re.search(rx, hay, re.I)}
+    # Регистрация — по навигации («Регистрация», «Личный кабинет», «Войти») или полю пароля,
+    # а не по любому слову «регистрация» в тексте («адрес регистрации», «регистрация сделок»)
+    nav = [l.text for p in site.pages for l in p.links] + [b for p in site.pages for b in p.buttons]
+    if any(REG_NAV_RE.match(t.strip()) for t in nav if len(t.strip()) < 40) or any(
+        i.type == "password" for p in site.pages for f in p.forms for i in f.inputs
+    ):
         features["registration"] = FEATURES["registration"][0]
     payments = sorted({name for u in site.all_request_urls() | {l.href for _, l in site.all_links()}
                        for host, name in PAYMENT_HOSTS.items() if host in u})
@@ -170,7 +183,7 @@ def build_profile(site: SiteData) -> dict:
     forms: list[dict] = []
     seen = set()
     for p in site.pages:
-        for f in p.forms:
+        for f in page_forms(p):
             kind = classify_form(f, p.url)
             key = (kind, form_signature(f), tuple(c.label[:60] for c in f.checkboxes))
             if kind == "search" or key in seen:
@@ -186,6 +199,7 @@ def build_profile(site: SiteData) -> dict:
                 "consent_checkbox": any(re.search(r"согла|персональн", c.label, re.I) for c in f.checkboxes),
                 "ad_consent_checkbox": any(re.search(r"реклам|рассылк|маркетинг|новост", c.label, re.I) for c in f.checkboxes),
                 "screenshot": f.screenshot,
+                "popup": f.popup,
             })
 
     # Товар — только упоминание рядом с ценой или кнопкой покупки (не правила, не статьи о запретах)
@@ -195,8 +209,15 @@ def build_profile(site: SiteData) -> dict:
         for p in site.pages:
             for m in re.finditer(rx, p.text, re.I):
                 window = p.text[max(0, m.start() - 150):m.end() + 150]
-                if PRICE_CTX_RE.search(window):
-                    found.add(m.group(0).lower())
+                before = p.text[max(0, m.start() - 250):m.start()]
+                # ингредиент в составе («…ванилин, коньяк.») — не товар
+                if re.search(r"состав|ингредиент|пропитк|начинк", before, re.I) or p.text[max(0, m.start() - 2):m.start()] == ", ":
+                    continue
+                if not PRICE_CTX_RE.search(window):
+                    continue
+                if name == "Алкоголь" and not ALCO_PRODUCT_RE.search(window):
+                    continue  # у алкогольного товара указывают объём или крепость
+                found.add(m.group(0).lower())
         if found:
             restricted[name] = sorted(found)[:5]
 

@@ -122,6 +122,11 @@ def check_ad_marking(site: SiteData) -> Finding:
     )
 
 
+# Признак интернет-магазина — добавление в корзину или ссылка на корзину; «Оформить заказ» бывает и у услуг
+CART_BTN_RE = re.compile(
+    r"(добавить\s+)?в\s+корзин[уе]|add\s+to\s+cart|checkout|(^|\n|\|)\s*корзина\s*($|\n|\||\(?\d)|корзина\s*\(?\d", re.I)
+CART_URL_RE = re.compile(r"/(cart|basket|korzina|personal/cart|shop/cart|checkout)(/|\.|$)|#popup:cart|#order", re.I)
+CART_RE = CART_BTN_RE
 SHOP_RE = re.compile(r"в\s+корзину|оформить\s+заказ|корзина|купить|добавить\s+в\s+корзину|checkout|add\s+to\s+cart", re.I)
 PRICE_RE = re.compile(r"\d[\d\s]{0,9}(?:[.,]\d{1,2})?\s?(₽|руб)", re.I)
 FOREIGN_PRICE_RE = re.compile(r"(\$|€|USD|EUR)\s?\d|\d\s?(\$|€|USD|EUR)")
@@ -129,8 +134,12 @@ FOREIGN_PRICE_RE = re.compile(r"(\$|€|USD|EUR)\s?\d|\d\s?(\$|€|USD|EUR)")
 
 def check_ecommerce(site: SiteData) -> Finding | None:
     text = all_text(site)
-    btns = " ".join(b for p in site.pages for b in p.buttons)
-    if not (SHOP_RE.search(btns) or len(SHOP_RE.findall(text)) >= 3) or not (PRICE_RE.search(text) or FOREIGN_PRICE_RE.search(text)):
+    btns = " | ".join(b for p in site.pages for b in p.buttons)
+    # Интернет-магазин — это корзина и оформление заказа, а не кнопка «Купить» у услуги
+    cart_link = any(CART_URL_RE.search(l.href) for _, l in site.all_links())
+    if not (CART_BTN_RE.search(btns) or cart_link or CART_BTN_RE.search(text)) or not (
+        PRICE_RE.search(text) or FOREIGN_PRICE_RE.search(text)
+    ):
         return None
     links_text = " ".join(f"{l.text} {l.href}" for _, l in site.all_links()) + " " + " ".join(d.href for d in site.document_links)
     hay = links_text + " " + text
@@ -174,10 +183,14 @@ def check_age_rating(site: SiteData) -> Finding:
     )
     if found:
         return Finding(**base, status="pass", severity="low", evidence=[found], summary=f"Найден знак возрастной категории: {found}.")
+    from .common import has_type
+    info_product = has_type(site, "media") or has_type(site, "education", strong=True)
     return Finding(
-        **base, status="warn", severity="low",
-        summary="Знак информационной продукции (0+, 6+, 12+, 16+, 18+) не найден. Требование обязательно для "
-        "сайтов, распространяющих информационную продукцию (СМИ, медиа, развлекательный контент, игры, курсы).",
+        **base, status="warn" if info_product else "info", severity="low",
+        summary="Знак информационной продукции (0+, 6+, 12+, 16+, 18+) не найден. "
+        + ("Для СМИ, медиа и образовательного контента он обязателен."
+           if info_product else "Он обязателен для сайтов, распространяющих информационную продукцию (СМИ, "
+           "развлекательный и обучающий контент); для сайта-визитки, магазина или услуг — как правило, нет."),
         recommendation="Если сайт содержит информационную продукцию, укажите возрастную категорию в шапке или футере.",
     )
 

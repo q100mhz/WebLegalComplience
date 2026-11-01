@@ -37,11 +37,18 @@ async def get_settings() -> dict:
     return {
         "scan_concurrency": int(data.get("scan_concurrency", settings.worker_concurrency)),
         "max_pages": int(data.get("max_pages", settings.max_pages)),
+        "keep_days": int(data.get("keep_days", settings.screenshots_keep_days)),
     }
 
 
-async def update_settings(scan_concurrency: int | None = None, max_pages: int | None = None) -> dict:
+KEEP_DAYS_CHOICES = (7, 30, 60, 90, 180, 365)
+
+
+async def update_settings(scan_concurrency: int | None = None, max_pages: int | None = None,
+                          keep_days: int | None = None) -> dict:
     changes = {}
+    if keep_days is not None:
+        changes["keep_days"] = min(KEEP_DAYS_CHOICES, key=lambda d: abs(d - int(keep_days)))
     if scan_concurrency is not None:
         changes["scan_concurrency"] = max(1, min(int(scan_concurrency), settings.max_concurrency))
     if max_pages is not None:
@@ -149,3 +156,47 @@ def load_series(scans: list[LoadScan], now: datetime, span_s: int, bucket_s: int
             "avg_duration_s": round(sum(durs) / len(durs)) if durs else None,
         })
     return out
+
+
+# ---------- Хранилище: скриншоты и снимки данных проверок ----------
+
+def _shots_root():
+    from pathlib import Path
+    return Path(settings.data_dir) / "shots"
+
+
+def storage_stats() -> dict:
+    """Сколько места занимают данные проверок (вызывать в отдельном потоке — обходит каталоги)."""
+    import shutil
+    root = _shots_root()
+    total = scans = 0
+    oldest = None
+    if root.exists():
+        for d in root.iterdir():
+            if not d.is_dir():
+                continue
+            scans += 1
+            mtime = d.stat().st_mtime
+            oldest = mtime if oldest is None else min(oldest, mtime)
+            total += sum(f.stat().st_size for f in d.iterdir() if f.is_file())
+    disk = shutil.disk_usage(root if root.exists() else settings.data_dir)
+    return {
+        "data_mb": round(total / 1024 / 1024, 1), "scans_with_data": scans,
+        "oldest": datetime.fromtimestamp(oldest).isoformat() if oldest else None,
+        "disk_free_gb": round(disk.free / 1024 ** 3, 1), "disk_total_gb": round(disk.total / 1024 ** 3, 1),
+    }
+
+
+def cleanup_data(keep_days: int) -> dict:
+    """Удаляет скриншоты и снимки данных проверок старше keep_days дней. Сами отчёты остаются в базе."""
+    import shutil
+    root = _shots_root()
+    limit = time.time() - keep_days * 86400
+    removed = freed = 0
+    if root.exists():
+        for d in root.iterdir():
+            if d.is_dir() and d.stat().st_mtime < limit:
+                freed += sum(f.stat().st_size for f in d.iterdir() if f.is_file())
+                shutil.rmtree(d, ignore_errors=True)
+                removed += 1
+    return {"removed_scans": removed, "freed_mb": round(freed / 1024 / 1024, 1)}

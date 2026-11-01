@@ -11,7 +11,7 @@ from pathlib import Path
 from urllib.parse import urlsplit
 
 import httpx
-from playwright.async_api import Browser, BrowserContext, Route, async_playwright
+from playwright.async_api import Browser, BrowserContext, Page, Route, async_playwright
 from playwright.async_api import TimeoutError as PlaywrightTimeout
 
 from ..config import settings
@@ -76,7 +76,10 @@ EXTRACT_JS = r"""
     }));
     return {
       action: f.getAttribute && f.getAttribute('action') || '', method: (f.getAttribute && f.getAttribute('method') || 'get').toLowerCase(),
-      inputs, checkboxes, text: txt(f).slice(0, 3000), index: idx,
+      inputs, checkboxes, index: idx,
+      // фразу о согласии часто ставят сразу под формой — берём и текст следующих блоков
+      text: (txt(f) + ' ' + [f.nextElementSibling, f.nextElementSibling && f.nextElementSibling.nextElementSibling]
+        .filter(Boolean).map(txt).join(' ').slice(0, 400)).slice(0, 3400),
       submit: [...f.querySelectorAll('button, input[type=submit], [role=button], a[class*=btn], [class*=button]')]
         .map(b => txt(b) || b.value || '').filter(Boolean).join(' | ').slice(0, 300),
       links: [...f.querySelectorAll('a[href]')].map(a => ({ href: a.getAttribute('href') || '', text: txt(a).slice(0, 200) })),
@@ -85,7 +88,15 @@ EXTRACT_JS = r"""
   return {
     title: document.title || '',
     lang: document.documentElement.getAttribute('lang') || '',
-    text: (document.body ? document.body.innerText : '').slice(0, 300000),
+    // innerText пуст на некоторых сайтах (контент в теневом DOM, особые стили) — тогда берём textContent
+    text: (() => {
+      if (!document.body) return '';
+      const t = document.body.innerText || '';
+      if (t.trim().length >= 200) return t.slice(0, 300000);
+      const c = document.body.cloneNode(true);
+      c.querySelectorAll('script,style,noscript,template,svg').forEach(e => e.remove());
+      return (c.textContent || '').replace(/[ \t]+/g, ' ').replace(/\s*\n\s*/g, '\n').trim().slice(0, 300000) || t;
+    })(),
     links, forms,
     generator: (document.querySelector('meta[name=generator]') || {}).content || '',
     consentPopup: !!document.querySelector('[data-bx-user-consent], .main-user-consent-request, [class*="main-user-consent-request"]'),
@@ -199,7 +210,8 @@ async def _visit(context: BrowserContext, url: str, shots: Shots, *, keep_html: 
     page.on("response", lambda r: responses.append(r) if r.request.is_navigation_request() and r.frame == page.main_frame else None)
     try:
         try:
-            resp = await page.goto(url, wait_until="domcontentloaded", timeout=settings.page_timeout_ms)
+            resp = await page.goto(url, wait_until="domcontentloaded",
+                                   timeout=settings.page_timeout_ms * (2 if keep_html else 1))
         except PlaywrightTimeout:
             # Тяжёлые сайты могут не дождаться DOMContentLoaded — анализируем то, что успело загрузиться
             if not responses:
@@ -212,11 +224,11 @@ async def _visit(context: BrowserContext, url: str, shots: Shots, *, keep_html: 
         except Exception:  # noqa: BLE001 — сайты с вечными long-poll запросами
             pass
         await page.wait_for_timeout(1000 if keep_html else 300)
-        data = await page.evaluate(EXTRACT_JS)
+        data = await _evaluate(page, EXTRACT_JS)
         if keep_html and len(data["text"]) < 300:
             # SPA и сайты с JS-проверкой браузера дорисовывают контент позже
             await page.wait_for_timeout(4000)
-            data = await page.evaluate(EXTRACT_JS)
+            data = await _evaluate(page, EXTRACT_JS)
         headers = {}
         if resp:
             try:
@@ -261,6 +273,95 @@ async def _visit(context: BrowserContext, url: str, shots: Shots, *, keep_html: 
         raise RuntimeError(f"{url}: {str(e).splitlines()[0][:200]}") from e
     finally:
         await page.close()
+
+
+async def _evaluate(page: Page, script: str):
+    """page.evaluate, переживающий перенаправление (JS-редирект, проверка браузера) во время разбора."""
+    try:
+        return await page.evaluate(script)
+    except Exception as e:  # noqa: BLE001
+        if "Execution context was destroyed" not in str(e) and "navigation" not in str(e).lower():
+            raise
+        try:
+            await page.wait_for_load_state("load", timeout=10000)
+        except Exception:  # noqa: BLE001
+            pass
+        await page.wait_for_timeout(1000)
+        return await page.evaluate(script)
+
+
+# ---------- Всплывающие формы ----------
+# Многие сайты показывают форму заявки только после нажатия кнопки («Оставить заявку», «Заказать звонок»):
+# в коде страницы её нет, она подгружается в окно. Нажимаем такие кнопки на главной и собираем появившиеся формы.
+
+CTA_RE = re.compile(
+    r"оставить\s+(заявку|контакт)|заказать\s+(звонок|консультац|расч|обратн)|обратн\w+\s+звон|перезвон|"
+    r"консультац|связаться|задать\s+вопрос|получить\s+(консультац|предложен|расч[её]т|скидк|прайс|кп)|"
+    r"записаться|напишите\s+нам|отправить\s+заявку|^заявка$|бесплатн\w+\s+(консультац|замер|расч)",
+    re.I,
+)
+CTA_JS = r"""
+() => {
+  const out = [], seen = new Set();
+  for (const el of document.querySelectorAll('button, a, [role=button], [onclick], [class*=btn], [class*=button]')) {
+    const t = (el.innerText || el.value || '').replace(/\s+/g, ' ').trim();
+    if (!t || t.length > 60 || seen.has(t.toLowerCase())) continue;
+    const href = el.tagName === 'A' ? (el.getAttribute('href') || '') : '';
+    if (href && !href.startsWith('#') && !href.toLowerCase().startsWith('javascript')) continue;  // ссылка на другую страницу
+    const r = el.getBoundingClientRect();
+    if (r.width < 5 || r.height < 5) continue;
+    seen.add(t.toLowerCase());
+    el.setAttribute('data-wlc-cta', String(out.length));
+    out.push(t);
+  }
+  return out;
+}
+"""
+
+
+async def _probe_popups(context: BrowserContext, url: str, shots: Shots, known: set[str], limit: int = 3) -> list[Form]:
+    page = await context.new_page()
+    found: list[Form] = []
+    try:
+        await page.goto(url, wait_until="domcontentloaded", timeout=settings.page_timeout_ms * 2)
+        try:
+            await page.wait_for_load_state("networkidle", timeout=4000)
+        except Exception:  # noqa: BLE001
+            pass
+        labels = await _evaluate(page, CTA_JS)
+        targets = [(i, t) for i, t in enumerate(labels) if CTA_RE.search(t)][:limit]
+        for idx, label in targets:
+            try:
+                await page.locator(f'[data-wlc-cta="{idx}"]').first.click(timeout=3000)
+            except Exception:  # noqa: BLE001 — кнопка перекрыта, скрыта или исчезла
+                continue
+            await page.wait_for_timeout(1800)  # окно открывается с анимацией, форма может подгружаться
+            if page.url.split("#")[0].rstrip("/") != url.split("#")[0].rstrip("/"):
+                break  # кнопка увела на другую страницу — её формы найдёт обычный обход
+            data = await _evaluate(page, EXTRACT_JS)
+            for f in data["forms"]:
+                form = Form(
+                    action=f["action"], method=f["method"], inputs=[FormInput(**i) for i in f["inputs"]],
+                    checkboxes=[Checkbox(**c) for c in f["checkboxes"]], text=f["text"],
+                    links=[Link(**l) for l in f["links"]], submit=f["submit"], index=f["index"], popup=True,
+                )
+                sig = form_signature(form)
+                if not form_is_pd(form) or sig in known:
+                    continue
+                known.add(sig)
+                if name := shots.take("form:" + sig):
+                    loc = page.locator(f'[data-wlc-form="{form.index}"]').first
+                    await _screenshot(loc.screenshot(path=str(shots.dir / name), type="jpeg", quality=70, timeout=3000),
+                                      form, name)
+                form.text = f"[Всплывающее окно «{label}»] " + form.text
+                found.append(form)
+            await page.keyboard.press("Escape")
+            await page.wait_for_timeout(400)
+    except Exception as e:  # noqa: BLE001 — поиск всплывающих форм не должен ронять проверку
+        log.info("popup probe failed for %s: %s", url, str(e).splitlines()[0][:200])
+    finally:
+        await page.close()
+    return found
 
 
 async def _screenshot(coro, target, name: str) -> None:
@@ -310,6 +411,9 @@ async def crawl(
                 await asyncio.sleep(6)
                 home = await _visit(context, start_url, shots, keep_html=True)
             site.timing["home_s"] = round(time.monotonic() - t_home, 1)
+            if dead := _dead_site(home):
+                raise BlockedError(f"Сайт не работает: {dead}. Проверка соответствия законодательству не проводится.",
+                                   diag={**_diag(home), "screenshot": home.screenshot, "dead_site": dead})
             if _looks_blocked(home):
                 diag = _diag(home)
                 log.warning("blocked: %s", diag)
@@ -323,6 +427,9 @@ async def crawl(
             site.initial_cookies = [
                 {"name": c["name"], "domain": c["domain"]} for c in await context.cookies()
             ]
+            # всплывающие формы ищем параллельно с обходом — cookies «до согласия» уже зафиксированы
+            popup_task = asyncio.create_task(
+                _probe_popups(context, home.url, shots, {form_signature(f) for f in home.forms}))
             if not site.https.https_ok and home.url.startswith("https://") and not _is_cert_error(site.https.cert_error):
                 # httpx мог не дождаться ответа, но браузер открыл сайт по HTTPS
                 site.https.https_ok, site.https.cert_error = True, None
@@ -445,6 +552,12 @@ async def crawl(
                 pages=len(site.pages),
                 errors=len(site.errors),
             )
+            try:
+                popups = await asyncio.wait_for(popup_task, timeout=45)
+            except Exception:  # noqa: BLE001
+                popups = []
+            home.forms.extend(popups)
+            site.stats["popup_forms"] = len(popups)
             await context.close()
         finally:
             await browser.close()
@@ -468,6 +581,31 @@ BLOCK_RE = re.compile(
     r"подтвердите,?\s+что\s+вы\s+не\s+робот|проверка\s+браузера|доступ\s+(запрещ|ограничен)|captcha|cloudflare ray id",
     re.I,
 )
+
+
+DEAD_SITE: list[tuple[str, str]] = [
+    (r"домен\s+\S+\s+прода[её]тся|доменное\s+имя\s+\S*\s*прода[её]тся|домен\s+прода[её]тся|domain\s+(is\s+)?for\s+sale|"
+     r"buy\s+this\s+domain|припаркован|domain\s+parking|sigmaparking", "домен выставлен на продажу (заглушка регистратора)"),
+    (r"сайт\s+заблокирован.{0,80}оплат|аккаунт\s+(заблокирован|приостановлен)|account\s+suspended|"
+     r"срок\s+(действия\s+)?(хостинга|услуги)\s+(истёк|истек|закончился)", "хостинг заблокирован или не оплачен"),
+    (r"(сайт|запрошенный\s+сайт)\s+отсутствует\s+на\s+(нашем\s+)?хостинге|домен\s+не\s+(прилинкован|привязан|"
+     r"настроен|делегирован)|site\s+not\s+found|no\s+such\s+app|default\s+web\s+page|welcome\s+to\s+nginx|"
+     r"it\s+works!|index\s+of\s+/", "на домене нет сайта (заглушка хостинга)"),
+    (r"сайт\s+(находится\s+)?в\s+разработке|сайт\s+скоро\s+(откроется|появится)|under\s+construction|coming\s+soon",
+     "сайт в разработке (заглушка)"),
+]
+
+
+def _dead_site(p: PageData) -> str | None:
+    """Заглушка вместо сайта: домен продаётся, хостинг не оплачен, сайт удалён или в разработке.
+    Проверяем только короткие страницы — на настоящем сайте такие фразы встречаются в тексте."""
+    head = f"{p.title}\n{p.text[:3000]}"
+    if len(p.text) > 8000 or len([l for l in p.links if l.href and not l.href.startswith(("#", "javascript"))]) > 400:
+        return None
+    for rx, reason in DEAD_SITE:
+        if re.search(rx, head, re.I):
+            return reason
+    return None
 
 
 def _looks_blocked(p: PageData) -> bool:

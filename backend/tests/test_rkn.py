@@ -105,3 +105,17 @@ def test_real_portal_card():
     for cat in ("фамилия", "телефон", "электронной почты"):
         assert cat in s["categories_text"]
     assert "Организация, обеспечение и регулирование трудовых" in s["purposes_text"]
+
+
+def test_individual_entrepreneur_row_without_inn_label():
+    """ИП с 12-значным ИНН: портал может не выводить «ИНН:» в строке — запись всё равно его."""
+    page = """<html><body><table id="ResList1"><thead><tr><td>Регистр. номер</td><td>Наименование</td>
+    <td>Основание</td><td>Дата</td><td>Дата</td></tr></thead>
+    <tr><td>55-19-001234</td><td><a href="?id=55-19-001234">Индивидуальный предприниматель Иванов Иван Иванович</a></td>
+    <td>Приказ № 1 от 01.02.2019</td><td>15.01.2019</td><td>10.01.2019</td></tr></table></body></html>"""
+    recs = parse_search(page, "550204020120")
+    assert len(recs) == 1 and recs[0]["reg_number"] == "55-19-001234"
+    assert recs[0]["name"].startswith("Индивидуальный предприниматель")
+    # строка с ДРУГИМ ИНН — не наша
+    other = page.replace("Иванович</a>", "Иванович</a><br/>ИНН: 550204020199")
+    assert parse_search(other, "550204020120") == []
