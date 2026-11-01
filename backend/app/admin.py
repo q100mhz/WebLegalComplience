@@ -6,7 +6,6 @@ import hmac
 import io
 import json
 import re
-import tempfile
 import time
 import zipfile
 from datetime import datetime, timedelta
@@ -21,6 +20,7 @@ from . import batches, rkn, runtime
 from .config import settings, shots_dir
 from .documents import documents_for, to_docx
 from .documents.howto import howto
+from .zipstream import stream_zip
 from .db import Batch, Feedback, RknCheck, Rule, Scan, SessionLocal, kv_get, utcnow
 from .scanner.urls import UrlError, normalize_input, site_key
 
@@ -426,22 +426,15 @@ async def batch_documents(batch_id: str):
         b = await _get_batch(db, batch_id)
         scans = (await db.execute(select(Scan).where(Scan.batch_id == batch_id, Scan.status == "done")
                                   .order_by(Scan.created_at))).scalars().all()
-    tmp = tempfile.SpooledTemporaryFile(max_size=50 * 1024 * 1024)
-    with zipfile.ZipFile(tmp, "w", zipfile.ZIP_DEFLATED) as zf:
+    name = b.name
+
+    def build(zf: zipfile.ZipFile) -> None:
         n = sum(_write_docs(zf, s, s.host) for s in scans)
-        zf.writestr("README.txt", f"Документы для сайтов пакета «{b.name}»: {len(scans)} сайтов, {n} документов.\n"
+        zf.writestr("README.txt", f"Документы для сайтов пакета «{name}»: {len(scans)} сайтов, {n} документов.\n"
                                   "Черновики сформированы по результатам проверки. Поля в квадратных скобках заполните, "
                                   "тексты согласуйте с юристом.\n")
-    tmp.seek(0)
 
-    def chunks():
-        try:
-            while chunk := tmp.read(1 << 20):
-                yield chunk
-        finally:
-            tmp.close()
-
-    return StreamingResponse(chunks(), media_type="application/zip",
+    return StreamingResponse(stream_zip(build), media_type="application/zip",
                              headers={"Content-Disposition": f"attachment; filename=documents-{batch_id[:8]}.zip"})
 
 
@@ -482,13 +475,14 @@ async def export_zip(days: int = 30, status: str = "", limit: int = 500, batch: 
         items.append({**row, "result": s.result, "feedback": feedback_by_scan.get(s.id, []),
                       "has_snapshot": (d / "site.json.gz").is_file()})
 
-    tmp = tempfile.SpooledTemporaryFile(max_size=50 * 1024 * 1024)
-    with zipfile.ZipFile(tmp, "w", zipfile.ZIP_DEFLATED) as zf:
+    rules_json = json.dumps([_rule_row(r) for r in rules_rows], ensure_ascii=False, indent=1)
+
+    def build(zf: zipfile.ZipFile) -> None:
         zf.writestr("scans.json", json.dumps(items, ensure_ascii=False, indent=1))
-        zf.writestr("rules.json", json.dumps([_rule_row(r) for r in rules_rows], ensure_ascii=False, indent=1))
+        zf.writestr("rules.json", rules_json)
         zf.writestr("README.txt", f"WebLegalCompliance — выгрузка {utcnow():%Y-%m-%d %H:%M} UTC, проверок: {len(items)}, "
-                                  f"за {days} дн.\nscans.json — результаты; files/<id>/ — скриншоты и site.json.gz "
-                                  "(снимок данных, по которым работали правила).\n")
+                                  f"за {days} дн.\nscans.json — результаты; files/<id>/ — скриншоты, site.json.gz "
+                                  "(снимок данных, по которым работали правила) и documents/ (документы под сайт).\n")
         for s in scans:
             _write_docs(zf, s, f"files/{s.id}/documents")
             d = shots_dir(s.id)
@@ -497,17 +491,9 @@ async def export_zip(days: int = 30, status: str = "", limit: int = 500, batch: 
                     if f.is_file():
                         zf.write(f, f"files/{s.id}/{f.name}", compress_type=zipfile.ZIP_STORED
                                  if f.suffix in (".jpg", ".gz") else zipfile.ZIP_DEFLATED)
-    tmp.seek(0)
+
     name = f"wlc-history-{utcnow():%Y%m%d-%H%M}.zip"
-
-    def chunks():
-        try:
-            while chunk := tmp.read(1 << 20):
-                yield chunk
-        finally:
-            tmp.close()
-
-    return StreamingResponse(chunks(), media_type="application/zip",
+    return StreamingResponse(stream_zip(build), media_type="application/zip",
                              headers={"Content-Disposition": f"attachment; filename={name}"})
 
 
