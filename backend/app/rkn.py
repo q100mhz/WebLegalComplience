@@ -15,6 +15,7 @@ import time
 from datetime import timedelta
 
 import httpx
+from sqlalchemy.exc import IntegrityError
 from lxml import html as lh
 
 from .db import RknCheck, SessionLocal, kv_get, kv_set, utcnow
@@ -25,7 +26,10 @@ PORTAL = "https://pd.rkn.gov.ru/operators-registry/operators-list/"
 KV_KEY = "rkn_portal"
 REQUEST_INTERVAL = 2.0
 TTL_FOUND = timedelta(days=30)
-TTL_NOT_FOUND = timedelta(days=1)  # уведомление могли подать — перепроверяем чаще
+TTL_NOT_FOUND = timedelta(days=1)
+# Увеличивать при каждом изменении разбора портала: кеш, сохранённый прежней версией, перепроверится.
+# 2 — ИП без подписи «ИНН» в строке результата; карточка оператора в записи.
+PARSER_VERSION = 2  # уведомление могли подать — перепроверяем чаще
 HEADERS = {
     "User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/140.0.0.0 Safari/537.36",
     "Accept": "text/html,application/xhtml+xml",
@@ -216,7 +220,8 @@ async def check_inn(inn: str, client: httpx.AsyncClient | None = None, use_cache
     """{inn, found, records, checked_at, cached} или {inn, error}."""
     async with SessionLocal() as db:
         row = await db.get(RknCheck, inn)
-        if use_cache and row and utcnow() - row.checked_at < (TTL_FOUND if row.found else TTL_NOT_FOUND):
+        if (use_cache and row and row.parser_version >= PARSER_VERSION
+                and utcnow() - row.checked_at < (TTL_FOUND if row.found else TTL_NOT_FOUND)):
             return {"inn": inn, "found": row.found, "records": row.records, "checked_at": row.checked_at.isoformat(),
                     "cached": True}
     own = client is None
@@ -242,10 +247,13 @@ async def check_inn(inn: str, client: httpx.AsyncClient | None = None, use_cache
     async with SessionLocal() as db:
         row = await db.get(RknCheck, inn)
         if row:
-            row.found, row.records, row.checked_at = bool(records), records, now
+            row.found, row.records, row.checked_at, row.parser_version = bool(records), records, now, PARSER_VERSION
         else:
-            db.add(RknCheck(inn=inn, found=bool(records), records=records, checked_at=now))
-        await db.commit()
+            db.add(RknCheck(inn=inn, found=bool(records), records=records, checked_at=now, parser_version=PARSER_VERSION))
+        try:
+            await db.commit()
+        except IntegrityError:  # тот же ИНН одновременно записала другая проверка — её результат не хуже
+            await db.rollback()
     return {"inn": inn, "found": bool(records), "records": records, "checked_at": now.isoformat(), "cached": False,
             **({"debug": debug} if debug else {})}
 

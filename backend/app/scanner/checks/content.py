@@ -8,22 +8,57 @@ from ..services_db import match_service
 from .common import EMAIL_RE, INN_RE, OGRN_RE, abs_link, all_text, short
 
 
+# Наименование владельца: «ООО «Ромашка»», «ИП Иванов И. И.», «Общество с ограниченной ответственностью «…»»
+OWNER_NAME_RE = re.compile(
+    r"\b(ООО|АО|ПАО|ЗАО|ОАО|НАО|АНО|ФГУП|МУП|ГУП|ГБУ|МБУ|ФГБУ)\s*[«\"“„][^»\"”]{2,60}[»\"”]|"
+    r"\bИП\s+[А-ЯЁ][а-яё]+(\s+[А-ЯЁ][а-яё.]+){0,2}|индивидуальн\w+\s+предпринимател\w*\s+[А-ЯЁ][а-яё]+|"
+    r"обществ\w+\s+с\s+ограниченной\s+ответственностью\s*[«\"“][^»\"”]{2,60}"
+)
+OWNER_PAGE_RE = re.compile(r"contact|kontakt|about|o-?kompanii|o-?nas|rekvizit|requisit|company|firm", re.I)
+
+
+OWNER_CTX_RE = re.compile(r"©|\(c\)|copyright|реквизит|юридическ\w+\s+адрес|все\s+права\s+защищены|наименование|"
+                          r"владел|оператор", re.I)
+NOT_OWNER_RE = re.compile(r"банк|яндекс|интерфакс|разработ|создани\w+\s+сайт|сделано|продвижени|дизайн|партн[её]р|"
+                          r"клиент|раскрыти|дочерн|акционер", re.I)
+
+
+def owner_name(site: SiteData) -> str:
+    """Наименование владельца рядом с ©, «Реквизиты», «юридический адрес» — в подвале или на страницах
+    «Контакты», «О компании», «Реквизиты». Банки-партнёры, разработчики сайта и клиенты из портфолио не в счёт."""
+    areas = [p.text for p in site.pages if OWNER_PAGE_RE.search(urlsplit(p.url).path)]
+    areas += [p.text[-1500:] for p in site.pages[:10]]  # подвал
+    for t in areas:
+        for m in OWNER_NAME_RE.finditer(t):
+            ctx = t[max(0, m.start() - 150):m.end() + 150]
+            if OWNER_CTX_RE.search(ctx) and not NOT_OWNER_RE.search(t[max(0, m.start() - 80):m.end() + 40]):
+                return re.sub(r"\s+", " ", m.group(0)).strip()
+    return ""
+
+
 def check_owner_info(site: SiteData) -> Finding:
     text = all_text(site)
     inn = INN_RE.search(text)
     ogrn = OGRN_RE.search(text)
+    name = owner_name(site)
     email = EMAIL_RE.search(text) or any(l.href.startswith("mailto:") for _, l in site.all_links())
     base = dict(
         id="owner_info", category="Информация о владельце", title="Сведения о владельце сайта",
         law="149-ФЗ, ч. 2 ст. 10; ЗоЗПП, ст. 9",
     )
-    ev = [x for x in (inn and inn.group(0), ogrn and ogrn.group(0)) if x]
+    ev = [x for x in (name, inn and inn.group(0), ogrn and ogrn.group(0)) if x]
     if (inn or ogrn) and email:
         return Finding(**base, status="pass", severity="low", evidence=ev,
                        summary="На сайте указаны реквизиты владельца и адрес электронной почты.")
+    if name and email:
+        # 149-ФЗ требует наименование, адрес и e-mail; ИНН/ОГРН обязательны продавцам (ЗоЗПП) — это в правиле магазина
+        return Finding(**base, status="pass", severity="low", evidence=ev,
+                       summary=f"Указаны наименование владельца ({name}) и адрес электронной почты. ИНН/ОГРН не найдены — "
+                       "для продавцов товаров и услуг их указание обязательно (ст. 9 ЗоЗПП).",
+                       recommendation="Добавьте ИНН и ОГРН (ОГРНИП) рядом с наименованием в подвале сайта.")
     missing = []
-    if not (inn or ogrn):
-        missing.append("ИНН/ОГРН и наименование владельца")
+    if not (inn or ogrn or name):
+        missing.append("наименование владельца и ИНН/ОГРН")
     if not email:
         missing.append("адрес электронной почты")
     return Finding(
@@ -34,9 +69,12 @@ def check_owner_info(site: SiteData) -> Finding:
     )
 
 
-AUTH_HOSTS = ("accounts.google.com", "appleid.apple.com", "facebook.com/dialog/oauth", "facebook.com/v",
-              "api.twitter.com/oauth", "twitter.com/i/oauth2", "x.com/i/oauth2", "github.com/login/oauth",
-              "login.microsoftonline.com", "discord.com/oauth2", "telegram.org/js/telegram-widget")
+# Только адреса, которые означают ВХОД: окно авторизации или кнопка входа. Служебные адреса Google API
+# (postmessageRelay от кнопки «Подписаться на YouTube», карт, переводчика) входом не являются.
+AUTH_URL_RE = re.compile(
+    r"accounts\.google\.com/(o/oauth2/(v2/)?auth|gsi/(client|button|select))|appleid\.apple\.com/auth|"
+    r"facebook\.com/(v[\d.]+/)?dialog/oauth|api\.twitter\.com/oauth|(twitter|x)\.com/i/oauth2|github\.com/login/oauth|"
+    r"login\.microsoftonline\.com/[^/]+/oauth2|discord\.com/oauth2", re.I)
 AUTH_TEXT_RE = re.compile(
     r"(войти|вход|зарегистрироваться|продолжить|sign\s?in|log\s?in|continue)\s+(через|с\s+помощью|with)\s+"
     r"(google|apple|facebook|twitter|github|microsoft|discord)", re.I,
@@ -46,8 +84,7 @@ AUTH_TEXT_RE = re.compile(
 def check_foreign_auth(site: SiteData) -> Finding:
     ev: list[str] = []
     for u in site.all_request_urls() | {abs_link(p, l) for p, l in site.all_links()}:
-        low = u.lower()
-        if any(h in low for h in AUTH_HOSTS) and ("oauth" in low or "auth" in low or "signin" in low or "gsi" in low):
+        if AUTH_URL_RE.search(u):
             ev.append(short(u))
     for p in site.pages:
         for b in p.buttons + [l.text for l in p.links]:
@@ -114,18 +151,26 @@ def check_ad_marking(site: SiteData) -> Finding:
     if erid_links or marked:
         return Finding(**base, status="pass", severity="low", evidence=[short(u) for u in erid_links[:5]],
                        summary="Найдены признаки маркировки рекламы (erid / пометка «Реклама»).")
+    # Сервисы рекламных сетей на сайте — чаще всего счётчики конверсий и ретаргетинга (Google Ads, VK Реклама) или блоки
+    # РСЯ, объявления в которых маркирует сама сеть. Собственных рекламных материалов сканер достоверно не видит —
+    # поэтому это сведение, а не нарушение.
     return Finding(
-        **base, status="warn", severity="medium", evidence=sorted(ad_networks),
-        summary="На сайте подключены рекламные сети, но признаков маркировки (erid, «Реклама», рекламодатель) не найдено.",
-        recommendation="Каждый рекламный материал должен иметь пометку «Реклама», сведения о рекламодателе и токен erid, "
-        "полученный через ОРД. Проверьте баннеры и партнёрские ссылки.",
+        **base, status="info", severity="low", evidence=sorted(ad_networks),
+        summary="На сайте подключены сервисы рекламных сетей (" + ", ".join(sorted(ad_networks)) + "). Чаще всего это "
+        "счётчики конверсий или блоки рекламной сети, где маркировку ставит сама сеть.",
+        recommendation="Если на сайте размещены собственные рекламные материалы (баннеры партнёров, партнёрские ссылки), "
+        "каждый должен иметь пометку «Реклама», сведения о рекламодателе и токен erid от ОРД.",
     )
 
 
 # Признак интернет-магазина — добавление в корзину или ссылка на корзину; «Оформить заказ» бывает и у услуг
 CART_BTN_RE = re.compile(
     r"(добавить\s+)?в\s+корзин[уе]|add\s+to\s+cart|checkout|(^|\n|\|)\s*корзина\s*($|\n|\||\(?\d)|корзина\s*\(?\d", re.I)
-CART_URL_RE = re.compile(r"/(cart|basket|korzina|personal/cart|shop/cart|checkout)(/|\.|$)|#popup:cart|#order", re.I)
+CART_URL_RE = re.compile(r"/(cart|basket|korzina|personal/cart|shop/cart|checkout)(/|\.|$)|#popup:cart", re.I)
+# В тексте страницы кнопка — отдельной строкой; «добавляете продукты в корзину на наших сайтах»
+# и «переработка нефти в корзину нефтепродуктов» — это не магазин
+CART_TEXT_RE = re.compile(r"(^|\n)[ \t]*(добавить\s+)?в\s+корзину[ \t]*($|\n)|(^|\n)[ \t]*корзина[ \t]*(\(?\d|$|\n)|"
+                          r"add\s+to\s+cart|товар\w*[^.\n]{0,40}в\s+корзину", re.I)
 CART_RE = CART_BTN_RE
 SHOP_RE = re.compile(r"в\s+корзину|оформить\s+заказ|корзина|купить|добавить\s+в\s+корзину|checkout|add\s+to\s+cart", re.I)
 PRICE_RE = re.compile(r"\d[\d\s]{0,9}(?:[.,]\d{1,2})?\s?(₽|руб)", re.I)
@@ -137,7 +182,7 @@ def check_ecommerce(site: SiteData) -> Finding | None:
     btns = " | ".join(b for p in site.pages for b in p.buttons)
     # Интернет-магазин — это корзина и оформление заказа, а не кнопка «Купить» у услуги
     cart_link = any(CART_URL_RE.search(l.href) for _, l in site.all_links())
-    if not (CART_BTN_RE.search(btns) or cart_link or CART_BTN_RE.search(text)) or not (
+    if not (CART_BTN_RE.search(btns) or cart_link or CART_TEXT_RE.search(text)) or not (
         PRICE_RE.search(text) or FOREIGN_PRICE_RE.search(text)
     ):
         return None
@@ -183,8 +228,8 @@ def check_age_rating(site: SiteData) -> Finding:
     )
     if found:
         return Finding(**base, status="pass", severity="low", evidence=[found], summary=f"Найден знак возрастной категории: {found}.")
-    from .common import has_type
-    info_product = has_type(site, "media") or has_type(site, "education", strong=True)
+    from .common import is_industry
+    info_product = is_industry(site, "media") or is_industry(site, "education")
     return Finding(
         **base, status="warn" if info_product else "info", severity="low",
         summary="Знак информационной продукции (0+, 6+, 12+, 16+, 18+) не найден. "
@@ -199,7 +244,8 @@ def check_language(site: SiteData) -> Finding:
     home = site.home
     text = home.text if home else ""
     cyr = len(re.findall(r"\b[а-яё]{3,}\b", text, re.I))
-    lat = len(re.findall(r"\b[a-z]{3,}\b", text, re.I))
+    # только обычные слова в нижнем регистре: названия брендов и продуктов (Bitrix24, CRM, iPhone) допустимы
+    lat = len(re.findall(r"\b[a-z]{3,}\b", text))
     ratio = lat / (cyr + lat) if cyr + lat else 0
     base = dict(
         id="language", category="Защита прав потребителей", title="Использование русского языка",
@@ -208,14 +254,21 @@ def check_language(site: SiteData) -> Finding:
     )
     if cyr + lat < 30:
         return Finding(**base, status="info", severity="low", summary="Недостаточно текста для оценки языка.")
-    if ratio > 0.5:
+    has_ru_version = any(re.fullmatch(r"(ru|рус\w*|русский)", l.text.strip(), re.I) or
+                         re.search(r"(^|/)ru(/|$)", urlsplit(l.href).path) for l in (home.links if home else []))
+    if ratio > 0.85 and (home and not home.lang.lower().startswith("ru")):
+        if has_ru_version:
+            return Finding(**base, status="info", severity="low",
+                           summary="Главная страница открывается на иностранном языке, но у сайта есть русская версия.",
+                           recommendation="Для посетителей из России лучше открывать русскую версию по умолчанию.")
         return Finding(
             **base, status="fail", severity="medium",
             summary="Основной текст сайта не на русском языке. Информация для потребителей в РФ должна "
             "предоставляться на русском языке.",
             recommendation="Сделайте русскую версию основной версией сайта для российских пользователей.",
         )
-    if ratio > 0.2:
+    # Названия брендов и продуктов латиницей (Битрикс24, CRM, iPhone) допустимы — риск только при явном перевесе
+    if ratio > 0.5:
         return Finding(
             **base, status="warn", severity="low",
             summary=f"Много текста латиницей ({ratio:.0%}). С 1 марта 2026 года иностранные слова в информации "

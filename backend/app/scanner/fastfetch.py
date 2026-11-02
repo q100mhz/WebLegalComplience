@@ -116,6 +116,9 @@ def parse_html(url: str, status: int, body: bytes, charset: str | None, headers:
     ]
     generator = next((m.get("content", "") for m in doc.iter("meta") if (m.get("name") or "").lower() == "generator"), "")
     title = _norm(doc.findtext(".//title"))
+    description = next((m.get("content", "") for m in doc.iter("meta") if (m.get("name") or "").lower() == "description"), "")[:500]
+    h1_el = next(iter(doc.iter("h1")), None)
+    h1 = _text(h1_el)[:300] if h1_el is not None else ""
     lang = doc.get("lang", "")
 
     consent_popup = bool(CONSENT_POPUP_RE.search(body))
@@ -153,6 +156,7 @@ def parse_html(url: str, status: int, body: bytes, charset: str | None, headers:
         url=url, status=status, title=title, lang=lang, text=text, links=links, forms=forms,
         iframes=iframes, buttons=[b for b in buttons if b][:300], request_urls=list(dict.fromkeys(resources)),
         generator=generator[:200], scripts=scripts, headers=headers, via="http", consent_popup=consent_popup,
+        description=description, h1=h1,
     )
 
 

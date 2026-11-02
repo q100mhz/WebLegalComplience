@@ -28,9 +28,12 @@ def check_https(site: SiteData) -> Finding:
         problems.append("нет редиректа с HTTP на HTTPS")
     if not h.hsts:
         problems.append("не настроен заголовок HSTS")
+    if h.cert_note:
+        problems.append(h.cert_note[0].lower() + h.cert_note[1:].rstrip("."))
     if not problems:
         return Finding(**base, status="pass", severity="low", summary="HTTPS настроен, есть редирект с HTTP и HSTS.")
-    only_hsts = problems == ["не настроен заголовок HSTS"]  # не требование закона, а рекомендация по защите
+    # HSTS и российский сертификат — не нарушение закона, а рекомендации
+    only_hsts = all(pr.startswith(("не настроен заголовок HSTS", "сертификат выпущен российским")) for pr in problems)
     return Finding(
         **base,
         status="fail" if insecure_forms else "info" if only_hsts else "warn",

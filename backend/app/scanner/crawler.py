@@ -99,6 +99,8 @@ EXTRACT_JS = r"""
     })(),
     links, forms,
     generator: (document.querySelector('meta[name=generator]') || {}).content || '',
+    description: ((document.querySelector('meta[name=description]') || {}).content || '').slice(0, 500),
+    h1: ((document.querySelector('h1') || {}).innerText || '').replace(/\s+/g, ' ').trim().slice(0, 300),
     consentPopup: !!document.querySelector('[data-bx-user-consent], .main-user-consent-request, [class*="main-user-consent-request"]'),
     scripts: [...document.querySelectorAll('script[src]')].map(s => s.src).slice(0, 200),
     iframes: [...document.querySelectorAll('iframe[src]')].map(i => i.src).slice(0, 100),
@@ -132,6 +134,12 @@ async def _check_https(host: str, info: HttpsInfo) -> None:
         except httpx.ConnectError as e:
             info.https_ok = False
             info.cert_error = str(e)[:300] if "certificate" in str(e).lower() or "ssl" in str(e).lower() else "HTTPS недоступен"
+            if info.cert_error and "certificate" in info.cert_error.lower() and await asyncio.to_thread(_russian_ca, host):
+                # Сертификат НУЦ Минцифры: его нет в стандартном списке доверенных центров, но он действителен
+                info.https_ok, info.cert_error = True, None
+                info.cert_note = ("Сертификат выпущен российским удостоверяющим центром (НУЦ Минцифры). Яндекс Браузер и "
+                                  "Атом ему доверяют, Chrome, Safari и Firefox по умолчанию — нет: часть посетителей "
+                                  "увидит предупреждение о небезопасном соединении.")
         except httpx.HTTPError as e:
             info.cert_error = str(e)[:300] or e.__class__.__name__
         try:
@@ -142,18 +150,45 @@ async def _check_https(host: str, info: HttpsInfo) -> None:
             info.http_redirects_to_https = None
 
 
-async def _geoip(ip: str) -> str | None:
-    """Страна по IP через открытый RIPEstat (без ключа)."""
+def _russian_ca(host: str) -> bool:
+    """Выпущен ли сертификат сайта российским УЦ (Russian Trusted Root/Sub CA, НУЦ Минцифры)."""
+    import socket
+    import ssl
+    ctx = ssl.create_default_context()
+    ctx.check_hostname = False
+    ctx.verify_mode = ssl.CERT_NONE
     try:
-        async with httpx.AsyncClient(timeout=8) as c:
-            r = await c.get("https://stat.ripe.net/data/maxmind-geo-lite/data.json", params={"resource": ip})
-            for res in r.json().get("data", {}).get("located_resources", []):
-                for loc in res.get("locations", []):
-                    if loc.get("country"):
-                        return loc["country"]
-    except Exception:  # noqa: BLE001 — геолокация не критична
-        log.info("geoip failed for %s", ip)
-    return None
+        with socket.create_connection((host, 443), timeout=8) as sock, ctx.wrap_socket(sock, server_hostname=host) as tls:
+            der = tls.getpeercert(binary_form=True) or b""
+        return b"Russian Trusted" in der
+    except OSError:
+        return False
+
+
+async def _geoip(ip: str) -> str | None:
+    """Страна по IP — по двум независимым источникам RIPEstat: геобаза MaxMind и регистрационные данные RIR.
+    Геобазы ошибаются на российских диапазонах (у РусГидро выходила Аргентина), поэтому при расхождении страну не
+    указываем — проверка расположения сервера покажет «не удалось однозначно определить», а не ложное нарушение."""
+    async def ask(url: str, key: str) -> str | None:
+        try:
+            async with httpx.AsyncClient(timeout=8) as c:
+                r = await c.get(url, params={"resource": ip})
+                for res in r.json().get("data", {}).get("located_resources", []):
+                    for loc in res.get("locations", []) or [res]:
+                        if loc.get(key):
+                            return str(loc[key]).upper()
+        except Exception:  # noqa: BLE001 — геолокация не критична
+            log.info("geoip %s failed for %s", url, ip)
+        return None
+
+    mm, rir = await asyncio.gather(
+        ask("https://stat.ripe.net/data/maxmind-geo-lite/data.json", "country"),
+        ask("https://stat.ripe.net/data/rir-geo/data.json", "location"),
+    )
+    if mm and rir and mm != rir:
+        log.info("geoip disagree for %s: maxmind=%s rir=%s", ip, mm, rir)
+        return None
+    return mm or rir
 
 
 async def _guard_route(route: Route) -> None:
@@ -257,6 +292,8 @@ async def _visit(context: BrowserContext, url: str, shots: Shots, *, keep_html: 
             request_urls=list(dict.fromkeys(requests)),
             generator=data["generator"][:200],
             consent_popup=data["consentPopup"],
+            description=data.get("description", ""),
+            h1=data.get("h1", ""),
             scripts=data["scripts"],
             headers=headers,
         )
@@ -378,9 +415,12 @@ async def crawl(
     shots_dir: Path | None = None,
     on_quick: Callable[[SiteData], Awaitable[None]] | None = None,
     max_pages: int | None = None,
+    time_budget: float | None = None,
 ) -> SiteData:
     """on_quick вызывается один раз, когда собраны главная и первые юридически значимые страницы
-    (settings.quick_pages страниц или settings.quick_seconds секунд) — для предварительного отчёта."""
+    (settings.quick_pages страниц или settings.quick_seconds секунд) — для предварительного отчёта.
+    time_budget — секунды на обход: по истечении обход останавливается и отчёт строится по собранным страницам."""
+    deadline = time.monotonic() + time_budget if time_budget else float("inf")
     max_pages = max_pages or settings.max_pages
     max_depth = settings.max_depth + (2 if max_pages > 100 else 0)  # глубокой проверке — больше уровней ссылок
     host = urlsplit(start_url).hostname or ""
@@ -404,7 +444,14 @@ async def crawl(
 
             # 1. Главная в "чистом" контексте — фиксируем cookies и запросы до согласия пользователя
             t_home = time.monotonic()
-            home = await _visit(context, start_url, shots, keep_html=True)
+            try:
+                home = await _visit(context, start_url, shots, keep_html=True)
+            except RuntimeError as e:
+                # сайт без HTTPS: порт 443 закрыт или на нём чужой/битый сертификат — пробуем http://
+                if not start_url.startswith("https://") or not HTTPS_FAIL_RE.search(str(e)):
+                    raise
+                start_url = "http://" + start_url[len("https://"):]
+                home = await _visit(context, start_url, shots, keep_html=True)
             if _looks_blocked(home):
                 # JS-проверки (DDoS-Guard, Qrator, антибот Битрикса) ставят cookie и пускают со второго захода
                 log.info("home looks blocked, retrying: %s", _diag(home))
@@ -433,6 +480,13 @@ async def crawl(
             if not site.https.https_ok and home.url.startswith("https://") and not _is_cert_error(site.https.cert_error):
                 # httpx мог не дождаться ответа, но браузер открыл сайт по HTTPS
                 site.https.https_ok, site.https.cert_error = True, None
+            elif "unable to get local issuer" in (site.https.cert_error or "") and home.url.startswith("https://"):
+                # сервер не отдаёт промежуточный сертификат: Chrome дозагружает его сам и сайт открывает,
+                # а Firefox, мобильные приложения и интеграции — нет
+                site.https.https_ok, site.https.cert_error = True, None
+                site.https.cert_note = ("Неполная цепочка сертификатов: сервер не передаёт промежуточный сертификат. "
+                                        "Chrome сайт откроет, а Firefox, часть мобильных браузеров и интеграции покажут "
+                                        "ошибку сертификата.")
             host = urlsplit(home.url).hostname or host  # после редиректа (например, на www)
             site.host = host
             if progress:
@@ -515,6 +569,9 @@ async def crawl(
             quick_sent = False
             in_flight: dict[asyncio.Task, int] = {}
             while (queue or in_flight) and len(site.pages) < max_pages:
+                if time.monotonic() > deadline:  # медленный сайт: отчёт по тому, что успели собрать
+                    site.stats["time_limit"] = True
+                    break
                 limit = settings.parallel_tabs + (HTTP_PARALLEL if mode == "hybrid" else 0)
                 while queue and len(in_flight) < limit and len(site.pages) + len(in_flight) < max_pages:
                     _, depth, _, url = heapq.heappop(queue)
@@ -532,6 +589,11 @@ async def crawl(
                         continue
                     if not is_same_site(pd.url, host) or len(site.pages) >= max_pages:
                         continue
+                    if SOFT_404_RE.search(pd.title or ""):
+                        # «Страница не найдена» с кодом 200: не страница сайта, а её относительные ссылки
+                        # порождают бесконечные адреса вида /a/b/a/b/ — не учитываем и не обходим
+                        site.stats["soft_404"] = site.stats.get("soft_404", 0) + 1
+                        continue
                     site.pages.append(pd)
                     if progress:
                         await progress(len(site.pages), pd.url)
@@ -543,7 +605,7 @@ async def crawl(
                         await on_quick(site)
             for task in in_flight:
                 task.cancel()
-            site.truncated = len(site.pages) >= max_pages and bool(queue or in_flight)
+            site.truncated = (len(site.pages) >= max_pages or site.stats.get("time_limit", False)) and bool(queue or in_flight)
             await http.aclose()
             inner = time.monotonic() - t_home - site.timing["home_s"]
             site.timing.update(
@@ -594,6 +656,12 @@ DEAD_SITE: list[tuple[str, str]] = [
     (r"сайт\s+(находится\s+)?в\s+разработке|сайт\s+скоро\s+(откроется|появится)|under\s+construction|coming\s+soon",
      "сайт в разработке (заглушка)"),
 ]
+
+
+HTTPS_FAIL_RE = re.compile(r"ERR_CONNECTION_REFUSED|ERR_CONNECTION_RESET|ERR_CONNECTION_CLOSED|ERR_EMPTY_RESPONSE|ERR_SSL|ERR_CERT|"
+                           r"ERR_HTTP2|ERR_TIMED_OUT|Timeout \d+ms exceeded")
+SOFT_404_RE = re.compile(r"^\s*(ошибка\s+)?404\b|\b404\b.{0,30}(не\s+найден|not\s+found)|страница\s+не\s+найдена|"
+                         r"^\s*page\s+not\s+found|^\s*not\s+found\s*$", re.I)
 
 
 def _dead_site(p: PageData) -> str | None:

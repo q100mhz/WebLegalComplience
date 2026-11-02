@@ -1,3 +1,5 @@
+import re
+
 import pytest
 
 from app.scanner.models import Checkbox, Form, FormInput, HttpsInfo, Link, PageData, SiteData
@@ -141,12 +143,14 @@ def test_invalid_inn_detected():
     assert by_id(build_report(site))["inn_valid"]["status"] == "fail"
 
 
-def test_newsletter_without_ad_consent():
+def test_newsletter_form_itself_is_consent_to_newsletter():
     site = good_site()
     site.pages[0].forms.append(Form(
         action="/sub", method="post", inputs=[FormInput("email", "email", "Ваш e-mail")],
         checkboxes=[], text="Подпишитесь на рассылку", links=[], submit="Подписаться",
     ))
+    assert by_id(build_report(site))["newsletter_consent"]["status"] == "info"
+    site.pages[0].forms[-1].checkboxes = [Checkbox(True, "Согласен получать рекламные рассылки")]
     assert by_id(build_report(site))["newsletter_consent"]["status"] == "fail"
 
 
@@ -160,12 +164,34 @@ def test_foreign_platform_with_forms():
 
 def test_medical_site_profile_and_checks():
     site = good_site()
-    site.pages[0].text += " Клиника. Приём врача-стоматолога, лечение, диагностика, анализы для пациентов."
+    site.pages[0].title = "Стоматология «Улыбка» в Омске"
+    site.pages[0].text += " Приём врача-стоматолога, лечение, диагностика, анализы для пациентов."
     r = build_report(site)
-    assert any(t["code"] == "medical" for t in r["profile"]["types"])
+    assert r["profile"]["industry"]["code"] == "medical"
     f = by_id(r)
     assert f["medical_info"]["status"] == "fail"
     assert f["medical_ads"]["status"] == "warn"
+
+
+@pytest.mark.parametrize("title,body,expected", [
+    ("Ветеринарная клиника «Живаго» в Омске", "Лечение животных, врач, УЗИ", "veterinary"),
+    ("Официальный сайт Компании «ЛУКОЙЛ»", "Карьера. Обучение сотрудников, наставничество, курсы, выпускники. " * 5, None),
+    ("Маркетплейс М.Видео", "Медицинская техника, лечение, диагностика, стоматологический ирригатор. Кредит, вклад. " * 5, None),
+    ("ITB2B — внедрение Битрикс24", "Кейсы: CRM для клиники, запись пациентов, врач, лечение, медицинский центр. " * 5, None),
+    ("Автошкола АСС, город Омск", "Обучение вождению", "education"),
+    ("СберБанк для физических лиц", "Кредиты, вклады", "finance"),
+    ("Банкетное меню — кафе «Провиант»", "Торты на заказ", None),
+])
+def test_industry_only_by_self_description(title, body, expected):
+    from app.scanner.profile import build_profile
+    site = good_site()
+    site.pages[0].title = title
+    site.pages[0].text = body
+    site.pages[0].description = body[:200]  # описание тоже бывает «про всё»
+    ind = build_profile(site)["industry"]
+    assert (ind or {}).get("code") == expected
+    if expected is None:
+        assert not any(t["code"] in ("medical", "education", "finance") for t in build_profile(site)["types"])
 
 
 def test_rkn_registry_lookup():
@@ -414,3 +440,117 @@ def test_registration_word_in_text_is_not_a_registration_feature():
     assert "registration" not in build_profile(site)["features"]
     site.pages[0].links.append(Link("/auth/?register=yes", "Регистрация"))
     assert "registration" in build_profile(site)["features"]
+
+
+@pytest.mark.parametrize("title,expected", [
+    ("Линейка - канцтовары и товары для офиса, товары для школы", None),
+    ("Квартиры в Омске: новостройки от застройщика", None),
+    ("12 канал: Новости. Видео. Телепрограмма", "media"),
+    ("Школа танцев «Ритм»", "education"),
+])
+def test_industry_title_edge_cases(title, expected):
+    from app.scanner.profile import detect_industry
+    site = good_site()
+    site.pages[0].title = title
+    assert ((detect_industry(site) or {}).get("code")) == expected
+
+
+def test_cosmetology_without_license_is_risk_not_violation():
+    site = good_site()
+    site.pages[0].title = "Центр красоты — парикмахерский зал, косметология"
+    assert by_id(build_report(site))["medical_info"]["status"] == "warn"
+
+
+@pytest.mark.parametrize("href,expected", [
+    ("/soglasie-na-obrabotku/", "pass"),
+    ("/files/soglasie-pdn.pdf", "pass"),
+    ("/privacy-policy/", "fail"),       # «согласие» ведёт на политику
+    ("/offer", "fail"),                 # …на оферту
+    ("/polzovatelskoe-soglashenie", "fail"),
+    ("#", "info"),                      # всплывающее окно — не проверить
+])
+def test_consent_link_judged_by_target(href, expected):
+    site = good_site()
+    for p in site.pages:
+        p.links = [l for l in p.links if "soglas" not in l.href]
+    f = site.pages[0].forms[0]
+    f.links = [Link(href, "согласие на обработку персональных данных")]
+    site.pages[0].links.append(Link(href, "согласие на обработку персональных данных"))
+    if href.endswith(".pdf"):
+        site.document_links.append(Link("https://example.ru" + href, "Согласие на обработку ПДн"))
+    assert by_id(build_report(site))["separate_consent"]["status"] == expected
+
+
+def test_consent_page_recognized_by_content_not_url():
+    """Страница /privacy-policy/ с заголовком «Согласие на обработку персональных данных» — это согласие."""
+    site = good_site()
+    for p in site.pages:
+        p.links = [l for l in p.links if "soglas" not in l.href]
+    site.pages[0].forms[0].links = []
+    site.pages[0].links.append(Link("/privacy-policy/", "Согласие на обработку персональных данных"))
+    site.pages.append(PageData(url="https://example.ru/privacy-policy/", status=200,
+                               title="Согласие на обработку персональных данных",
+                               text="Настоящим я даю согласие ООО «Ромашка» на обработку моих персональных данных. " * 30))
+    assert by_id(build_report(site))["separate_consent"]["status"] == "pass"
+
+
+def test_consent_inside_policy_page_and_unfilled_template():
+    site = good_site()
+    for p in site.pages:
+        p.links = [l for l in p.links if "soglas" not in l.href]
+    site.pages[0].forms[0].links = []
+    site.pages[0].links.append(Link("/company/consent/", "Согласие на обработку персональных данных"))
+    site.pages.append(PageData(url="https://example.ru/company/consent/", status=200, title="Политика конфиденциальности",
+                               text="Политика конфиденциальности. Согласие. Я, заполняя форму, даю свое согласие на обработку."))
+    assert by_id(build_report(site))["separate_consent"]["status"] == "warn"
+    site.pages[-1].title = ""
+    site.pages[-1].text = ("СОГЛАСИЕ на обработку персональных данных. Пользователь, оставляя заявку на сайте http://(адрес сайта), "
+                           "даёт своё согласие название компании (полные реквизиты компании) на обработку.")
+    f = by_id(build_report(site))["separate_consent"]
+    assert f["status"] == "warn" and "шаблон" in f["summary"]
+
+
+def test_consent_link_to_pdf_is_separate_document():
+    site = good_site()
+    for p in site.pages:
+        p.links = [l for l in p.links if "soglas" not in l.href]
+    site.pages[0].forms[0].links = [Link("/upload/iblock/ab7/ab7f2fd.pdf", "согласие")]
+    site.pages[0].links += site.pages[0].forms[0].links
+    assert by_id(build_report(site))["separate_consent"]["status"] == "pass"
+
+
+def test_footer_cookie_policy_link_is_not_banner():
+    from app.scanner.checks.pdn import has_cookie_banner
+    p = PageData(url="https://example.ru/", status=200, title="t",
+                 text="Главная\nПолитика в отношении файлов cookie\nКонтакты",
+                 links=[Link("/cookie-policy/", "Политика в отношении файлов cookie")])
+    assert not has_cookie_banner(p)
+    p.text += "\nПродолжая использовать сайт, вы соглашаетесь с использованием файлов cookie.\nПринять"
+    assert has_cookie_banner(p)
+
+
+def test_spaced_inn_and_owner_name_in_footer():
+    from app.scanner.checks.common import INN_RE, digits
+    assert digits(INN_RE.search("ИНН 5507 2931 13").group(1)) == "5507293113"
+    assert digits(INN_RE.search("ИНН 5501234567 550101001").group(1)) == "5501234567"
+    site = good_site()
+    for p in site.pages:
+        p.text = re.sub(r"ИНН\s*\d+|ОГРН\s*\d+", "", p.text)
+    site.pages[0].text += "\nПартнёр: ПАО «Сбербанк»\n© 2026 ООО «Ромашка». Все права защищены. info@romashka.ru"
+    f = by_id(build_report(site))["owner_info"]
+    assert f["status"] == "pass" and "Ромашка" in f["summary"]
+
+
+def test_prose_about_cart_is_not_shop():
+    site = good_site()
+    site.pages[0].text = "Переработка нефти в корзину нефтепродуктов. Цена 100 руб."
+    assert "ecommerce" not in by_id(build_report(site))
+
+
+def test_policy_link_detection_excludes_other_policies():
+    from app.scanner.checks.common import link_is_policy
+    assert not link_is_policy(Link("/about/anti-corruption-policy/", "Антикоррупционная политика"))
+    assert not link_is_policy(Link("/retail/personalnyj-kredit/", "Кредит"))
+    assert not link_is_policy(Link("/soglasie-na-obrabotku-personalnyh-dannyh/", "Согласие на обработку персональных данных"))
+    assert link_is_policy(Link("/policy", "Документы"))
+    assert link_is_policy(Link("/x.pdf", "Personal data processing policy"))

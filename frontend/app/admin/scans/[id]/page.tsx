@@ -14,7 +14,7 @@ interface Detail {
   result: (Report & {
     errors?: string[];
     timing?: Record<string, number>;
-    stats?: { mode?: string; browser?: number; http?: number };
+    stats?: { mode?: string; browser?: number; http?: number; time_limit?: boolean; soft_404?: number };
     truncated?: boolean;
     diagnostics?: Record<string, string | number | null>;
   }) | null;
@@ -77,7 +77,9 @@ export default function ScanDetail({ params }: { params: Promise<{ id: string }>
               <b>{r.stats.mode === "hybrid" ? "гибридный" : "только браузер (сайт на JavaScript)"} · браузером {r.stats.browser}, HTTP {r.stats.http}</b>
             </div>
           )}
-          {r.truncated && <p className="meta">Достигнут лимит страниц — на сайте есть и другие страницы.</p>}
+          {r.truncated && <p className="meta">{r.stats?.time_limit
+            ? "Сайт отвечал медленно — отчёт построен по страницам, проверенным за отведённое время."
+            : "Достигнут лимит страниц — на сайте есть и другие страницы."}</p>}
         </div>
       )}
 

@@ -103,6 +103,8 @@ class RknCheck(Base):
     found: Mapped[bool] = mapped_column(Boolean, default=False)
     records: Mapped[list] = mapped_column(JSONB, default=list)
     checked_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow, index=True)
+    # версия разбора портала: при её смене кеш перепроверяется (иначе живут ответы старой, ошибочной версии)
+    parser_version: Mapped[int] = mapped_column(Integer, default=1)
 
 
 class KV(Base):
@@ -138,6 +140,7 @@ async def init_db() -> None:
         await conn.execute(text("ALTER TABLE scans ADD COLUMN IF NOT EXISTS started_at TIMESTAMPTZ"))
         await conn.execute(text("ALTER TABLE scans ADD COLUMN IF NOT EXISTS max_pages INTEGER"))
         await conn.execute(text("ALTER TABLE batches ADD COLUMN IF NOT EXISTS paused BOOLEAN NOT NULL DEFAULT FALSE"))
+        await conn.execute(text("ALTER TABLE rkn_checks ADD COLUMN IF NOT EXISTS parser_version INTEGER NOT NULL DEFAULT 1"))
     # Добавляем новые правила из кода, не трогая отредактированные в админке
     async with SessionLocal() as db:
         existing = set((await db.execute(select(Rule.id))).scalars())

@@ -116,8 +116,11 @@ async def _scan(ctx, scan: Scan) -> None:
             log.exception("quick report failed for %s", scan_id)
 
     try:
-        site = await asyncio.wait_for(crawl(scan.url, progress, shots_dir(scan_id), on_quick, scan.max_pages),
-                                      timeout=scan_timeout(scan.max_pages))
+        # обход сам останавливается за 90 с до предела (всплывающие формы — до 45 с, РКН, отчёт);
+        # жёсткий таймаут — страховка от зависания браузера
+        limit = scan_timeout(scan.max_pages)
+        site = await asyncio.wait_for(crawl(scan.url, progress, shots_dir(scan_id), on_quick, scan.max_pages,
+                                            time_budget=limit - 90), timeout=limit + 60)
         site.profile["rkn"] = await rkn.lookup(find_inns(site))
         try:  # снимок до построения отчёта: в профиле только данные РКН, остальное пересчитывается
             snapshot.save(site, shots_dir(scan_id))
@@ -137,7 +140,8 @@ async def _scan(ctx, scan: Scan) -> None:
         if "net::ERR_NAME_NOT_RESOLVED" in msg or "ERR_CONNECTION" in msg:
             msg = "Сайт недоступен"
         if msg.startswith("http") and ": Page.goto" in msg:
-            msg = "Главная страница сайта не загрузилась за отведённое время"
+            msg = ("Главная страница сайта не ответила за 30 секунд. Вероятно, сайт перегружен или его защита "
+                   "не пускает автоматические проверки")
         # Подробности для админки (в публичный отчёт не попадают)
         diag = e.diag if isinstance(e, BlockedError) else {"exception": f"{type(e).__name__}: {str(e)[:1000]}"}
         await _update(scan_id, status="failed", error=msg, finished_at=utcnow(), result={"diagnostics": diag},

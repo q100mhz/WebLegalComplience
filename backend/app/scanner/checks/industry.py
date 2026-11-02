@@ -3,7 +3,10 @@
 import re
 
 from ..models import Finding, SiteData
-from .common import INN_RE, OGRN_RE, all_text, form_is_pd, has_type, link_is_policy, short, unique_pd_forms
+from .common import (
+    INN_RE, OGRN_RE, all_text, digits, form_is_pd, has_type, is_industry, is_service_form, link_is_policy, page_links_policy,
+    policy_urls, short, unique_pd_forms,
+)
 
 
 def _links_text(site: SiteData) -> str:
@@ -13,10 +16,14 @@ def _links_text(site: SiteData) -> str:
 
 
 def check_policy_on_form_pages(site: SiteData) -> Finding | None:
-    pages = {p.url: p for p in site.pages if any(form_is_pd(f) for f in p.forms)}
+    # фрагмент без <title> (/partial/form.php) подгружается внутрь другой страницы — её ссылок у него нет;
+    # вход и восстановление пароля — для тех, кто уже дал данные
+    pages = {p.url: p for p in site.pages
+             if (p is site.home or (p.title or "").strip()) and any(form_is_pd(f) and not is_service_form(f, p.url) for f in p.forms)}
     if not pages or not any(link_is_policy(l) for _, l in site.all_links()):
         return None
-    missing = [u for u, p in pages.items() if not any(link_is_policy(l) for l in p.links)]
+    urls = policy_urls(site)
+    missing = [u for u, p in pages.items() if not page_links_policy(p, urls)]
     base = dict(id="policy_on_form_pages", category="Персональные данные",
                 title="Ссылка на политику на страницах с формами", law="152-ФЗ, ч. 2 ст. 18.1")
     if not missing:
@@ -40,22 +47,32 @@ def check_newsletter_consent(site: SiteData) -> Finding | None:
         return None
     base = dict(id="newsletter_consent", category="Реклама", title="Согласие на получение рекламных рассылок",
                 law="38-ФЗ, ч. 1 ст. 18")
-    no_consent = [f for f in forms if not f["ad_consent_checkbox"]]
-    if no_consent:
+    prechecked_ads = [
+        (p.url, c.label) for p in site.pages for f in p.forms for c in f.checkboxes
+        if c.checked and re.search(r"реклам|рассылк|маркетинг|новости\s+и\s+(акци|предложен)|спецпредложен", c.label, re.I)
+    ]
+    if prechecked_ads:
         return Finding(
-            **base, status="fail", severity="medium",
-            evidence=[f"{short(f['page'], 90)} — поля: {', '.join(f['fields'])}" for f in no_consent[:8]],
-            summary=f"Форм подписки на рассылку без согласия на получение рекламы: {len(no_consent)}.",
-            recommendation="Добавьте отдельный необязательный чекбокс «Согласен получать рекламные и информационные "
-            "рассылки». Без такого согласия рассылка считается распространённой без согласия адресата.",
+            **base, status="fail", severity="medium", evidence=[f"{short(u, 80)}: «{l[:100]}»" for u, l in prechecked_ads[:5]],
+            summary="Согласие на получение рекламы отмечено заранее — это не согласие адресата.",
+            recommendation="Чекбокс согласия на рекламные рассылки должен быть пустым по умолчанию и необязательным.",
         )
     if combined:
         return Finding(
             **base, status="warn", severity="medium", evidence=[f"{short(u, 80)}: «{l[:100]}»" for u, l in combined[:5]],
-            summary="Согласие на рекламу объединено с согласием на обработку ПДн в одном чекбоксе.",
+            summary="Согласие на рекламу объединено с согласием на обработку ПДн в одном чекбоксе: отказаться от рекламы, "
+            "не отказавшись от отправки формы, нельзя.",
             recommendation="Разделите согласия: обязательный чекбокс на обработку ПДн и отдельный необязательный — на рекламу.",
         )
-    return Finding(**base, status="pass", severity="low", summary="Формы подписки содержат отдельное согласие на рекламу.")
+    # Отдельная форма подписки: подписываясь, человек сам соглашается получать именно эту рассылку — нарушения нет.
+    return Finding(
+        **base, status="info", severity="low",
+        evidence=[f"{short(f['page'], 90)} — поля: {', '.join(f['fields'])}" for f in forms[:5]],
+        summary="Есть формы подписки на рассылку. Подписка в отдельной форме сама выражает согласие получать эту рассылку; "
+        "если в неё входят рекламные предложения, это должно быть понятно из текста формы.",
+        recommendation="Укажите рядом с формой, что придёт в рассылке (новости, акции, предложения), и дайте ссылку "
+        "«Отписаться» в каждом письме.",
+    )
 
 
 def check_special_categories(site: SiteData) -> Finding | None:
@@ -130,8 +147,9 @@ def _ogrn_ok(ogrn: str) -> bool:
 
 def check_inn_valid(site: SiteData) -> Finding | None:
     text = all_text(site)
-    inns = sorted({m.group(1) for m in INN_RE.finditer(text)})
-    ogrns = sorted({m.group(2) for m in OGRN_RE.finditer(text)})
+    # номер с пробелами, не прошедший проверку, — скорее ИНН и соседнее число, а не опечатка
+    inns = sorted({digits(m.group(1)) for m in INN_RE.finditer(text) if m.group(1).isdigit() or _inn_ok(digits(m.group(1)))})
+    ogrns = sorted({digits(m.group(2)) for m in OGRN_RE.finditer(text) if m.group(2).isdigit() or _ogrn_ok(digits(m.group(2)))})
     if not inns and not ogrns:
         return None
     bad = [f"ИНН {x}" for x in inns if not _inn_ok(x)] + [f"ОГРН {x}" for x in ogrns if not _ogrn_ok(x)]
@@ -162,7 +180,7 @@ def check_restricted_goods(site: SiteData) -> Finding | None:
 
 
 def check_education(site: SiteData) -> Finding | None:
-    if not has_type(site, "education", strong=True):
+    if not is_industry(site, "education"):
         return None
     hay = all_text(site) + " " + _links_text(site)
     base = dict(id="education_info", category="Отраслевые требования", title="Образовательная деятельность",
@@ -187,17 +205,24 @@ def check_education(site: SiteData) -> Finding | None:
 
 
 def check_medical(site: SiteData) -> list[Finding]:
-    if not has_type(site, "medical", strong=True):
+    if not is_industry(site, "medical"):
         return []
     text = all_text(site)
     res = []
-    licensed = re.search(r"лицензи\w*.{0,40}(№|n\b|номер)?\s*[лl]?[0о]?\d{2,}|Л0\d{2}-", text, re.I)
+    licensed = re.search(r"лицензи\w*.{0,40}(№|n\b|номер)?\s*[лl]?[0о]?\d{2,}|Л0\d{2}-", text, re.I) or any(
+        re.search(r"лиценз|license", f"{l.text} {l.href}", re.I) for _, l in site.all_links())  # раздел «Лицензии»
+    cosmetology = "косметолог" in ((site.profile.get("industry") or {}).get("signal", "")).lower()
     res.append(Finding(
         id="medical_info", category="Отраслевые требования", title="Сведения о медицинской лицензии",
         law="323-ФЗ, ст. 79; ПП РФ № 736",
-        status="pass" if licensed else "fail", severity="low" if licensed else "medium",
-        summary="Сведения о медицинской лицензии найдены." if licensed else
-        "Сайт оказывает медицинские услуги, но номер лицензии не найден.",
+        # косметология бывает и немедицинской (уход), а лицензия нужна для инъекций, аппаратных процедур и т.п.
+        status="pass" if licensed else "warn" if cosmetology else "fail",
+        severity="low" if licensed else "medium",
+        summary="Сведения о медицинской лицензии найдены." if licensed else (
+            "Сайт предлагает косметологические услуги, но номер медицинской лицензии не найден. Лицензия обязательна, "
+            "если оказываются медицинские косметологические услуги (инъекции, аппаратные и пилинговые процедуры, "
+            "услуги врача-косметолога); для немедицинского ухода — нет."
+            if cosmetology else "Сайт оказывает медицинские услуги, но номер лицензии не найден."),
         recommendation="" if licensed else "Разместите номер и дату лицензии, перечень работ (услуг), сведения о "
         "врачах и порядок оказания платных услуг.",
     ))
@@ -227,12 +252,16 @@ def check_supplements(site: SiteData) -> Finding | None:
 
 
 def check_finance(site: SiteData) -> Finding | None:
-    if not has_type(site, "finance", strong=True):
+    if not is_industry(site, "finance"):
         return None
     text = all_text(site)
     missing = []
-    if re.search(r"кредит|займ", text, re.I) and not re.search(r"полн\w+\s+стоимост\w+\s+(кредит|займ)|\bпск\b", text, re.I):
-        missing.append("полная стоимость кредита (займа)")
+    # ПСК должна стоять там же, где реклама ставки: страница с «кредит/займ» и «от N% годовых» без ПСК
+    no_psk = [p.url for p in site.pages
+              if re.search(r"кредит|займ", p.text, re.I) and re.search(r"\d+(?:[.,]\d+)?\s?%\s*(годовых|в\s+год)", p.text, re.I)
+              and not re.search(r"полн\w+\s+стоимост\w+\s+(кредит|займ)|\bпск\b", p.text, re.I)]
+    if no_psk:
+        missing.append("полная стоимость кредита (займа) рядом со ставкой — страницы: " + ", ".join(short(u, 60) for u in no_psk[:3]))
     if not re.search(r"лицензи|банк\s+россии|реестр\w*\s+(мфо|микрофинанс|цб)|цб\s+рф", text, re.I):
         missing.append("сведения о лицензии / записи в реестре Банка России")
     base = dict(id="finance_info", category="Реклама", title="Обязательная информация о финансовых услугах",
@@ -265,9 +294,11 @@ def check_user_terms(site: SiteData) -> Finding | None:
                    _links_text(site), re.I)
     return Finding(
         id="user_terms", category="Защита прав потребителей", title="Пользовательское соглашение",
-        law="ГК РФ, ст. 428, 437", status="pass" if ok else "warn", severity="low",
+        law="ГК РФ, ст. 428, 437", status="pass" if ok else "info", severity="low",
+        # закон не обязывает публиковать пользовательское соглашение — без него просто сложнее защищать свои интересы
         summary="Условия использования сервиса опубликованы." if ok else
-        "На сайте есть регистрация, но не найдено пользовательское соглашение или оферта.",
+        "На сайте есть регистрация, но не найдено пользовательское соглашение или оферта. Закон его не требует, но без "
+        "него условия пользования (ответственность, блокировка, порядок споров) ничем не закреплены.",
         recommendation="" if ok else "Опубликуйте пользовательское соглашение и давайте на него ссылку при регистрации.",
     )
 

@@ -58,6 +58,8 @@ class PageData:
     screenshot: str | None = None
     via: str = "browser"  # browser | http — чем загружена страница
     consent_popup: bool = False  # согласие во всплывающем окне (компонент main.userconsent Битрикса)
+    description: str = ""  # meta description — как сайт описывает себя
+    h1: str = ""
 
 
 @dataclass
@@ -66,6 +68,7 @@ class HttpsInfo:
     cert_error: str | None = None
     http_redirects_to_https: bool | None = None
     hsts: bool = False
+    cert_note: str = ""  # пояснение о сертификате (например, выпущен российским УЦ)
     security_headers: dict[str, bool] = field(default_factory=dict)
 
 
